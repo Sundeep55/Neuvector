@@ -1,0 +1,133 @@
+{{/*
+Fail-fast guardrails. These run at render time, so ArgoCD reports the error on
+the app instead of half-applying a broken NeuVector. Every check below maps to a
+failure mode we can actually hit with this topology.
+*/}}
+
+{{- $role := .Values.dcs.role -}}
+{{- $fed := .Values.core.controller.federation -}}
+
+{{/* 1. Valid role */}}
+{{- if not (has $role (list "standalone" "hub" "managed")) -}}
+{{- fail (printf "dcs.role must be one of standalone|hub|managed, got %q" $role) -}}
+{{- end -}}
+
+{{/* 2. Cluster name is the federation identity — never leave it blank. */}}
+{{- if not .Values.dcs.clusterName -}}
+{{- fail "dcs.clusterName is required (unique per cluster, e.g. qa-hub, qa-managed-01)" -}}
+{{- end -}}
+
+{{/* 3. Role must agree with the federation services actually being created. */}}
+{{- if eq $role "hub" -}}
+  {{- if not $fed.mastersvc.type -}}
+  {{- fail "dcs.role=hub requires core.controller.federation.mastersvc.type (e.g. ClusterIP) so neuvector-svc-controller-fed-master exists" -}}
+  {{- end -}}
+  {{- if $fed.managedsvc.type -}}
+  {{- fail "dcs.role=hub must NOT set core.controller.federation.managedsvc.type — the hub is the primary, it does not join anything" -}}
+  {{- end -}}
+{{- else if eq $role "managed" -}}
+  {{- if not $fed.managedsvc.type -}}
+  {{- fail "dcs.role=managed requires core.controller.federation.managedsvc.type (e.g. ClusterIP) so neuvector-svc-controller-fed-managed exists" -}}
+  {{- end -}}
+  {{- if $fed.mastersvc.type -}}
+  {{- fail "dcs.role=managed must NOT set core.controller.federation.mastersvc.type — only the hub runs the fed-master endpoint" -}}
+  {{- end -}}
+{{- else -}}
+  {{- if or $fed.mastersvc.type $fed.managedsvc.type -}}
+  {{- fail "dcs.role=standalone must not enable any core.controller.federation.*svc.type" -}}
+  {{- end -}}
+{{- end -}}
+
+{{/* 4. Federated clusters need fedinitcfg.yaml, which carries the join token. */}}
+{{- if ne $role "standalone" -}}
+  {{- if not (hasKey (.Values.dcs.secrets.init.encryptedData | default dict) "fedinitcfg.yaml") -}}
+  {{- fail (printf "dcs.role=%s requires dcs.secrets.init.encryptedData['fedinitcfg.yaml'] — generate it with scripts/seal.sh fedinit" $role) -}}
+  {{- end -}}
+{{- end -}}
+
+{{/* 5. Passthrough Route means the manager pod terminates TLS itself. */}}
+{{- if and .Values.core.openshift .Values.core.manager.route.enabled -}}
+  {{- if not .Values.core.manager.route.host -}}
+  {{- fail "core.manager.route.host is required when the manager Route is enabled (the cert SAN must match it; wildcards are not permitted)" -}}
+  {{- end -}}
+  {{- if and (eq .Values.core.manager.route.termination "passthrough") (not .Values.core.manager.env.ssl) -}}
+  {{- fail "core.manager.route.termination=passthrough requires core.manager.env.ssl=true" -}}
+  {{- end -}}
+{{- end -}}
+
+{{/* 5b. Vanilla clusters expose the UI through an Ingress instead of a Route. */}}
+{{- if not .Values.core.openshift -}}
+  {{- if .Values.core.manager.route.enabled -}}
+  {{- fail "core.manager.route.enabled=true but core.openshift=false — Routes do not exist on vanilla Kubernetes; use core.manager.ingress instead" -}}
+  {{- end -}}
+  {{- if .Values.core.manager.ingress.enabled -}}
+    {{- if not .Values.core.manager.ingress.host -}}
+    {{- fail "core.manager.ingress.host is required when the manager Ingress is enabled" -}}
+    {{- end -}}
+    {{- if and .Values.core.manager.ingress.tls (not .Values.core.manager.ingress.secretName) -}}
+    {{- fail "core.manager.ingress.tls=true requires core.manager.ingress.secretName (normally dcs-neuvector-external-certs)" -}}
+    {{- end -}}
+  {{- else if .Values.core.manager.enabled -}}
+  {{- fail "no way to reach the NeuVector UI: core.openshift=false and core.manager.ingress.enabled=false" -}}
+  {{- end -}}
+{{- end -}}
+
+{{/* 6. A referenced cert secret must actually be produced by something. */}}
+{{- $ext := .Values.dcs.secrets.externalTls -}}
+{{- range $ref := list .Values.core.manager.certificate.secret .Values.core.controller.certificate.secret -}}
+  {{- if and $ref (eq $ref $ext.name) $ext.enabled (not $ext.encryptedData) -}}
+  {{- fail (printf "%s is referenced as a certificate secret but dcs.secrets.externalTls.encryptedData is empty — seal the cert first, or set dcs.secrets.externalTls.enabled=false if the secret is created out-of-band" $ext.name) -}}
+  {{- end -}}
+{{- end -}}
+
+{{/* 7. cert-manager internal CA: the upstream template renders an empty
+      secretName unless every component points at the Issuer's secret. */}}
+{{- if .Values.core.internal.certmanager.enabled -}}
+  {{- $want := .Values.core.internal.certmanager.secretname -}}
+  {{- range $c := list "controller" "enforcer" }}
+    {{- $got := (index $.Values.core $c).internal.certificate.secret -}}
+    {{- if ne $got $want -}}
+    {{- fail (printf "core.%s.internal.certificate.secret must equal core.internal.certmanager.secretname (%s), got %q" $c $want $got) -}}
+    {{- end -}}
+  {{- end -}}
+  {{- if ne $.Values.core.cve.scanner.internal.certificate.secret $want -}}
+  {{- fail (printf "core.cve.scanner.internal.certificate.secret must equal %s" $want) -}}
+  {{- end -}}
+  {{- if and $.Values.core.cve.adapter.enabled (ne $.Values.core.cve.adapter.internal.certificate.secret $want) -}}
+  {{- fail (printf "core.cve.adapter.internal.certificate.secret must equal %s" $want) -}}
+  {{- end -}}
+{{- end -}}
+
+{{/* 8. Under ArgoCD, autoGenerateCert produces a new self-signed cert on every
+      render (the upstream lookup helper cannot read the live cluster), which
+      means permanent drift plus a pod restart per sync. */}}
+{{- if eq "true" (toString .Values.core.autoGenerateCert) -}}
+{{- fail "core.autoGenerateCert must be false under GitOps — it regenerates certs on every render, causing permanent ArgoCD drift. Supply certs via dcs.secrets.*" -}}
+{{- end -}}
+
+{{/* 9. The upstream chart must never own neuvector-init; this chart does. */}}
+{{- if or .Values.core.controller.configmap.enabled .Values.core.controller.secret.enabled -}}
+{{- fail "core.controller.configmap.enabled / core.controller.secret.enabled must stay false — dcs-neuvector owns the neuvector-init ConfigMap and SealedSecret" -}}
+{{- end -}}
+
+{{/* 10. The CVE database only refreshes if the scanner image is re-pulled. */}}
+{{- if and .Values.core.cve.updater.enabled (ne .Values.core.cve.scanner.image.imagePullPolicy "Always") -}}
+{{- fail "core.cve.scanner.image.imagePullPolicy must be Always — the updater CronJob only restarts the scanner Deployment, so a cached image means a stale CVE database" -}}
+{{- end -}}
+
+{{/* 11. The Harbor adapter is useless without the basic-auth pair Harbor
+       presents to it, and it only belongs on the hub (Harbor lives there). */}}
+{{- if .Values.core.cve.adapter.enabled -}}
+  {{- if ne $role "hub" -}}
+  {{- fail "core.cve.adapter.enabled is only valid on the hub — Harbor runs there and the adapter joins the local NeuVector controller" -}}
+  {{- end -}}
+  {{- $aa := .Values.dcs.secrets.adapterAuth -}}
+  {{- if and $aa.enabled (not $aa.encryptedData) -}}
+  {{- fail "core.cve.adapter.enabled=true requires dcs.secrets.adapterAuth.encryptedData (username + password) — Harbor authenticates to the adapter with basic auth" -}}
+  {{- end -}}
+{{- end -}}
+
+{{/* 12. imagePullSecrets is a single name upstream, not a list. */}}
+{{- if kindIs "slice" .Values.core.imagePullSecrets -}}
+{{- fail "core.imagePullSecrets must be a single string (the secret name), not a list" -}}
+{{- end -}}

@@ -1,0 +1,66 @@
+{{- if and .Values.core.openshift .Values.dcs.openshiftSCC.create }}
+{{/*
+The upstream chart creates no SCC and no SCC binding, so a stock OpenShift
+cluster rejects the enforcer (hostPID + privileged) and the controller
+(runAsUser: 0) under restricted-v2.
+
+Granting SCC access through RBAC is the declarative equivalent of
+`oc adm policy add-scc-to-user <scc> -z <sa> -n <ns>`.
+
+At 5.6 the requirements are:
+  enforcer   -> hostPID: true, securityContext.privileged: true  => privileged
+  controller -> securityContext.runAsUser: 0                     => anyuid
+  manager/scanner/updater/cert-upgrader/adapter -> stable UID    => anyuid
+*/}}
+{{- $privSAs := splitList "," (include "dcs-neuvector.privilegedServiceAccounts" .) }}
+{{- $stdSAs  := splitList "," (include "dcs-neuvector.standardServiceAccounts" .) }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: dcs-neuvector-scc-privileged
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{ include "dcs-neuvector.labels" . | indent 4 }}
+  {{- with .Values.dcs.commonAnnotations }}
+  annotations:
+{{ toYaml . | indent 4 }}
+  {{- end }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:openshift:scc:{{ .Values.dcs.openshiftSCC.privilegedSCC }}
+subjects:
+{{- range $sa := $privSAs }}
+{{- if $sa }}
+  - kind: ServiceAccount
+    name: {{ $sa }}
+    namespace: {{ $.Release.Namespace }}
+{{- end }}
+{{- end }}
+{{- if and .Values.core.leastPrivilege (compact $stdSAs) }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: dcs-neuvector-scc-standard
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{ include "dcs-neuvector.labels" . | indent 4 }}
+  {{- with .Values.dcs.commonAnnotations }}
+  annotations:
+{{ toYaml . | indent 4 }}
+  {{- end }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:openshift:scc:{{ .Values.dcs.openshiftSCC.standardSCC }}
+subjects:
+{{- range $sa := $stdSAs }}
+{{- if $sa }}
+  - kind: ServiceAccount
+    name: {{ $sa }}
+    namespace: {{ $.Release.Namespace }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

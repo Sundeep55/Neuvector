@@ -1,0 +1,122 @@
+# ==============================================================================
+# PROD HUB (airgapped) — federation PRIMARY for 2+ managed clusters.
+# Admin-only. Sizing below is a starting point: re-measure after 2 weeks with
+#   oc adm top pods -n dcs-neuvector
+# and raise limits before you raise requests.
+# ==============================================================================
+
+dcs:
+  role: hub
+  clusterName: prod-hub
+
+  systemConfig:
+    alwaysReload: true
+    newServicePolicyMode: Discover
+    # Airgapped: never phone home.
+    noTelemetryReport: true
+    autoScan: false
+    # Let the controller scale scanners with the queue instead of pinning a
+    # count. Only takes effect once you are happy with per-scanner sizing.
+    scannerAutoscale:
+      strategy: ""        # set to "delayed" to enable
+      minPods: 3
+      maxPods: 8
+
+  secrets:
+    imagePull:
+      encryptedData:
+        .dockerconfigjson: REPLACE_WITH_KUBESEAL_OUTPUT
+    externalTls:
+      encryptedData:
+        tls.crt: REPLACE_WITH_KUBESEAL_OUTPUT
+        tls.key: REPLACE_WITH_KUBESEAL_OUTPUT
+    bootstrap:
+      encryptedData:
+        bootstrapPassword: REPLACE_WITH_KUBESEAL_OUTPUT
+    # Only needed when core.cve.adapter.enabled=true below.
+    adapterAuth:
+      enabled: false
+      # encryptedData:
+      #   username: REPLACE_WITH_KUBESEAL_OUTPUT
+      #   password: REPLACE_WITH_KUBESEAL_OUTPUT
+    init:
+      enabled: true
+      encryptedData:
+        fedinitcfg.yaml: REPLACE_WITH_KUBESEAL_OUTPUT
+
+core:
+  openshift: true
+
+  controller:
+    replicas: 3
+    disruptionbudget: 2
+    pvc:
+      enabled: true
+      storageClass: ocs-storagecluster-cephfs
+      capacity: 20Gi
+    # The hub aggregates federated policy and remote-cluster status on top of its
+    # own workload graph, so it is the memory-hungriest controller in the fleet.
+    resources:
+      requests:
+        cpu: "1"
+        memory: 4Gi
+      limits:
+        cpu: "4"
+        memory: 8Gi
+    federation:
+      mastersvc:
+        type: ClusterIP
+        route:
+          enabled: true
+          termination: passthrough
+          host: neuvector-fed.apps.ocp-prod-hub.x.com
+
+  enforcer:
+    resources:
+      requests:
+        cpu: 300m
+        memory: 1Gi
+      limits:
+        cpu: "2"
+        memory: 3Gi
+
+  manager:
+    route:
+      enabled: true
+      termination: passthrough
+      host: neuvector.apps.ocp-prod-hub.x.com
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: "1"
+        memory: 2Gi
+
+  cve:
+    scanner:
+      # Scanner memory tracks the size of the largest image being unpacked, not
+      # the number of images. 4Gi covers typical app images; raise it if you see
+      # OOMKills on fat base images.
+      replicas: 3
+      resources:
+        requests:
+          cpu: 500m
+          memory: 2Gi
+        limits:
+          cpu: "2"
+          memory: 4Gi
+    updater:
+      # Harbor airgap replication lands at 02:00 -> restart scanners at 03:00.
+      schedule: "0 3 * * *"
+
+    # Harbor pluggable-scanner adapter — replaces Trivy as Harbor's scanner so
+    # Harbor stops needing internet access for a CVE database.
+    # To enable: set enabled=true, seal dcs.secrets.adapterAuth above, then in
+    # Harbor -> Administration -> Interrogation Services -> + NEW SCANNER:
+    #   Endpoint  https://neuvector-service-registry-adapter.dcs-neuvector.svc.cluster.local:9443/endpoint
+    #   Auth      Basic, with the username/password you sealed
+    #   Trust     add the internal CA (see templates/certificate-adapter.yaml)
+    # then mark it the default scanner and remove Trivy.
+    adapter:
+      enabled: false

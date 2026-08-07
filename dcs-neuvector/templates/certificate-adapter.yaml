@@ -1,0 +1,62 @@
+{{- if and .Values.core.cve.adapter.enabled .Values.dcs.adapter.inClusterCert.enabled }}
+{{/*
+TLS for the Harbor pluggable-scanner adapter, reached over in-cluster Service DNS.
+
+Harbor calls the adapter, so the adapter needs a server certificate whose SAN
+matches the Service DNS name Harbor dials. The upstream chart's cert-manager
+support only covers component mTLS, so we issue this one ourselves.
+
+Signed by a CA Issuer backed by the same internal CA the upstream chart already
+creates (`internal.certmanager.secretname`), which means Harbor can verify it by
+trusting exactly one CA:
+
+  oc -n {{ .Release.Namespace }} get secret {{ .Values.core.internal.certmanager.secretname }} \
+    -o jsonpath='{.data.ca\.crt}' | base64 -d
+
+Add that to Harbor's trusted CAs and leave "Skip certificate verification"
+UNCHECKED. If you would rather not touch Harbor's trust store, set
+dcs.adapter.inClusterCert.enabled=false and tick the skip box instead.
+*/}}
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: dcs-neuvector-internal-ca
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{ include "dcs-neuvector.labels" . | indent 4 }}
+spec:
+  ca:
+    secretName: {{ .Values.core.internal.certmanager.secretname }}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ .Values.dcs.adapter.inClusterCert.secretName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{ include "dcs-neuvector.labels" . | indent 4 }}
+spec:
+  secretName: {{ .Values.dcs.adapter.inClusterCert.secretName }}
+  duration: {{ .Values.dcs.adapter.inClusterCert.duration }}
+  renewBefore: {{ .Values.dcs.adapter.inClusterCert.renewBefore }}
+  privateKey:
+    algorithm: RSA
+    size: 4096
+  commonName: neuvector-service-registry-adapter.{{ .Release.Namespace }}.svc
+  dnsNames:
+    - neuvector-service-registry-adapter
+    - neuvector-service-registry-adapter.{{ .Release.Namespace }}
+    - neuvector-service-registry-adapter.{{ .Release.Namespace }}.svc
+    - neuvector-service-registry-adapter.{{ .Release.Namespace }}.svc.cluster.local
+  {{- with .Values.dcs.adapter.inClusterCert.extraDnsNames }}
+{{ toYaml . | indent 4 }}
+  {{- end }}
+  usages:
+    - digital signature
+    - key encipherment
+    - server auth
+  issuerRef:
+    group: cert-manager.io
+    kind: Issuer
+    name: dcs-neuvector-internal-ca
+{{- end }}

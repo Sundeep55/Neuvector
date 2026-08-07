@@ -1,0 +1,32 @@
+dcs-neuvector {{ .Chart.Version }}  (NeuVector {{ .Chart.AppVersion }}, core-2.11.0)
+
+  cluster        : {{ .Values.dcs.clusterName }}
+  role           : {{ .Values.dcs.role }}
+  namespace      : {{ .Release.Namespace }}
+  images         : {{ .Values.core.registry }}/{{ .Values.core.controller.image.repository }}:{{ .Values.core.tag }}
+  scanner        : {{ .Values.core.registry }}/{{ .Values.core.cve.scanner.image.repository }}:{{ .Values.core.cve.scanner.image.tag }} (pullPolicy {{ .Values.core.cve.scanner.image.imagePullPolicy }})
+  CVE refresh    : {{ if .Values.core.cve.updater.enabled }}CronJob {{ .Values.core.cve.updater.schedule }} (restarts scanners -> re-pull){{ else }}DISABLED{{ end }}
+{{- if .Values.core.openshift }}
+  UI             : https://{{ .Values.core.manager.route.host }}  (Route, {{ .Values.core.manager.route.termination }})
+{{- else if .Values.core.manager.ingress.enabled }}
+  UI             : https://{{ .Values.core.manager.ingress.host }}  (Ingress)
+{{- end }}
+{{- if eq .Values.dcs.role "hub" }}
+  fed-master     : https://{{ .Values.core.controller.federation.mastersvc.route.host }}:443
+{{- else if eq .Values.dcs.role "managed" }}
+  fed-managed    : https://{{ .Values.core.controller.federation.managedsvc.route.host }}:443
+{{- end }}
+
+First login: user `admin`, password from the bootstrap secret:
+
+  oc -n {{ .Release.Namespace }} get secret {{ .Values.dcs.secrets.bootstrap.name }} \
+    -o jsonpath='{.data.bootstrapPassword}' | base64 -d
+
+Verify the declarative config was applied:
+
+  oc -n {{ .Release.Namespace }} logs deploy/neuvector-controller-pod | grep -i initcfg
+{{ if ne .Values.dcs.role "standalone" }}
+Federation is auto-joined from fedinitcfg.yaml. Confirm on the hub UI under the
+multi-cluster switcher; if a managed cluster does not appear, check that the
+join token matches on both sides and that the clocks are in sync.
+{{- end }}

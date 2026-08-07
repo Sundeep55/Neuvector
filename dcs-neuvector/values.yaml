@@ -1,0 +1,723 @@
+# ==============================================================================
+# dcs-neuvector — NaaS wrapper chart for NeuVector core-2.11.0 (appVersion 5.6.0)
+# ==============================================================================
+# Layout:
+#   dcs.*   -> settings owned by THIS wrapper chart (secrets, SCC, system config)
+#   core.*  -> passthrough to the upstream neuvector/core subchart
+#
+# Everything here is a safe, environment-agnostic default. Per-environment
+# overrides live in the app-of-apps values file (see envs/ for worked examples).
+#
+# HARD RULE: no plaintext secret ever lands in git. Every credential/key is
+# delivered as a SealedSecret whose encryptedData blobs are produced by
+# scripts/seal.sh against the target cluster's sealed-secrets controller.
+# ==============================================================================
+
+
+# ------------------------------------------------------------------------------
+# dcs — wrapper-owned settings
+# ------------------------------------------------------------------------------
+dcs:
+
+  # Cluster role in the hub-and-spoke topology.
+  #   standalone -> single cluster, no federation           (dev)
+  #   hub        -> federation PRIMARY, admins only          (qa-hub, prod-hub)
+  #   managed    -> federation REMOTE, joins the hub         (qa-managed, prod-managed-*)
+  # This drives the fedinitcfg.yaml expectations and the template guardrails.
+  # The matching core.controller.federation.* service/route values must be set
+  # in the same env values file — templates/validate.yaml fails the render if
+  # they disagree, so a wrong combination can never reach the cluster.
+  role: standalone
+
+  # Unique, stable name for this cluster inside the federation. Shown in the
+  # multi-cluster switcher on the hub UI. MUST be unique per environment.
+  # e.g. qa-hub, qa-managed-01, prod-hub, prod-managed-01
+  clusterName: ""
+
+  # ----------------------------------------------------------------------------
+  # System configuration pushed declaratively into NeuVector at controller start.
+  # Rendered into ConfigMap `neuvector-init` -> mounted at /etc/config/sysinitcfg.yaml
+  # Contains NO secrets, so it stays a plain ConfigMap in git (auditable/diffable).
+  # ----------------------------------------------------------------------------
+  systemConfig:
+    enabled: true
+
+    # true  -> re-applied on every controller restart (GitOps: git is the truth,
+    #          manual UI drift is reverted).
+    # false -> applied only on first start / full cluster restart.
+    alwaysReload: true
+
+    # Discover | Monitor | Protect. Stay on Discover for release 1; the
+    # D2M/M2P automation below is the migration path for the next release.
+    newServicePolicyMode: Discover
+
+    # zero-drift | basic
+    newServiceProfileBaseline: zero-drift
+
+    # Automated mode migration (kept OFF now, wired so enabling is a values-only
+    # change later). Duration is seconds, valid range 3600..2592000.
+    modeAuto:
+      discoverToMonitor: false
+      discoverToMonitorDuration: 0
+      monitorToProtect: false
+      monitorToProtectDuration: 0
+
+    # Airgapped clusters must not phone home.
+    noTelemetryReport: true
+
+    # Istio/Linkerd sidecar awareness. Off unless a service mesh is in play.
+    monitorServiceMesh: false
+
+    # Honour X-Forwarded-For (we sit behind the OpenShift router).
+    xffEnabled: true
+
+    # Hours before an unused group is aged out. 0..168.
+    unusedGroupAging: 24
+
+    # Let namespace-scoped (tenant) users export the network policy of their own
+    # groups. Turn on when tenant self-service lands.
+    allowNsUserExportNetPolicy: false
+
+    # Auto-scan every newly discovered workload image. Costs scanner CPU; with
+    # 800 namespaces enable deliberately, not by default.
+    autoScan: false
+
+    # Scanner autoscaling by the controller. strategy: "" | immediate | delayed
+    # Leave strategy empty to keep the static cve.scanner.replicas count.
+    scannerAutoscale:
+      strategy: ""
+      minPods: 1
+      maxPods: 3
+
+    # Escape hatch: any other sysinitcfg.yaml key documented upstream, merged
+    # verbatim on top of the generated file.
+    # e.g.  Syslog_status: true
+    #       Syslog_ip: 10.0.0.1
+    extra: {}
+
+  # ----------------------------------------------------------------------------
+  # SealedSecrets. encryptedData is filled in per cluster by scripts/seal.sh.
+  # A secret with an empty encryptedData map is simply NOT rendered, so this
+  # chart installs cleanly in dev before every credential exists.
+  # scope: strict (default) | namespace-wide | cluster-wide — must match how the
+  # blob was sealed by kubeseal.
+  # ----------------------------------------------------------------------------
+  secrets:
+
+    # Pull secret for registry.x.com/internal-images/*
+    imagePull:
+      enabled: true
+      name: dcs-neuvector-registry
+      type: kubernetes.io/dockerconfigjson
+      scope: strict
+      encryptedData: {}
+      #  .dockerconfigjson: AgB...
+
+    # ONE externally-signed certificate per cluster, shared by every endpoint a
+    # non-NeuVector client can reach: the UI (manager), the controller REST API
+    # and — on the hub — the registry adapter. Its SAN list must therefore cover
+    # every one of those hostnames, whether or not the Route is enabled today
+    # (SANs are free; re-issuing certs across deployed environments is not).
+    # Route termination is passthrough, so the pod serves this cert directly.
+    # See ../csr/ for the matching CSR configs.
+    externalTls:
+      enabled: true
+      name: dcs-neuvector-external-certs
+      type: kubernetes.io/tls
+      scope: strict
+      encryptedData: {}
+      #  tls.crt: AgB...   (leaf + intermediates, in that order)
+      #  tls.key: AgB...
+
+    # Initial admin password for the local `admin` account.
+    # NeuVector reads this secret via the API at first start; it is NOT mounted.
+    # Key must be exactly `bootstrapPassword`.
+    bootstrap:
+      enabled: true
+      name: neuvector-bootstrap-secret
+      type: Opaque
+      scope: strict
+      encryptedData: {}
+      #  bootstrapPassword: AgB...
+
+    # Declarative NeuVector config that DOES contain secrets. Projected into the
+    # controller at /etc/config alongside the ConfigMap above.
+    # Keys used today:
+    #   fedinitcfg.yaml  — federation join token + primary endpoint (hub/managed)
+    # Keys reserved for the next iteration:
+    #   ldapinitcfg.yaml — admin AD bind DN/password
+    #   oidcinitcfg.yaml — Keycloak client secret + group->namespace role mapping
+    #   roleinitcfg.yaml — custom tenant role definition
+    #
+    # NOTE: a filename may exist in EITHER this secret OR the systemConfig
+    # ConfigMap, never both — they are merged by a projected volume and
+    # duplicate paths make the controller pod fail to start.
+    init:
+      enabled: true
+      name: neuvector-init
+      type: Opaque
+      scope: strict
+      encryptedData: {}
+      #  fedinitcfg.yaml: AgB...
+
+    # Basic-auth pair Harbor uses when calling the registry adapter (hub only).
+    # Leave encryptedData empty on clusters where the adapter is disabled.
+    adapterAuth:
+      enabled: true
+      name: dcs-neuvector-adapter-auth
+      type: Opaque
+      scope: strict
+      encryptedData: {}
+      #  username: AgB...
+      #  password: AgB...
+
+  # Free-form additional SealedSecrets, same shape as above. Use for things this
+  # chart does not know about yet (e.g. Harbor robot creds for registry scanning).
+  extraSecrets: {}
+  #  harborRobot:
+  #    enabled: true
+  #    name: neuvector-harbor-robot
+  #    type: Opaque
+  #    scope: strict
+  #    encryptedData:
+  #      username: AgB...
+  #      password: AgB...
+
+  # ----------------------------------------------------------------------------
+  # Harbor pluggable-scanner adapter (hub only). Enabling this lets Harbor
+  # delegate image scanning to NeuVector instead of Trivy, which removes Trivy's
+  # need to pull a CVE database over the internet — NeuVector's database arrives
+  # inside the mirrored scanner image.
+  #
+  # Turn the workload on with core.cve.adapter.enabled=true (hub values file).
+  # ----------------------------------------------------------------------------
+  adapter:
+    # Harbor runs in this same cluster, so it reaches the adapter over Service
+    # DNS and no Route / firewall rule is involved:
+    #   https://neuvector-service-registry-adapter.<ns>.svc.cluster.local:9443/endpoint
+    # This issues a server cert for exactly those names from the internal CA, so
+    # Harbor can verify it instead of skipping verification.
+    inClusterCert:
+      enabled: true
+      secretName: dcs-neuvector-adapter-certs
+      duration: 8760h      # 1 year
+      renewBefore: 720h    # 30 days
+      extraDnsNames: []
+
+  # ----------------------------------------------------------------------------
+  # OpenShift SecurityContextConstraints access.
+  # The upstream chart does NOT create or bind any SCC. Requirements at 5.6:
+  #   enforcer   -> hostPID + privileged  => `privileged` SCC
+  #   controller -> runAsUser: 0          => `anyuid` SCC
+  #   others     -> `anyuid` (stable UID, avoids the random-UID reassignment)
+  # Bound via RBAC (RoleBinding -> system:openshift:scc:<name>), which is the
+  # declarative equivalent of `oc adm policy add-scc-to-user`.
+  # ----------------------------------------------------------------------------
+  openshiftSCC:
+    create: true
+    privilegedSCC: privileged
+    standardSCC: anyuid
+
+  # Extra labels/annotations stamped on every object this wrapper creates.
+  commonLabels: {}
+  commonAnnotations: {}
+
+
+# ------------------------------------------------------------------------------
+# core — upstream neuvector/core 2.11.0
+# Only the keys we actually steer are listed. Anything omitted keeps the
+# upstream default. Rancher, Azure/AWS marketplace, CSP billing, PSP, k3s,
+# bottlerocket, docker-shim and the `prime` (enterprise) compliance image are
+# deliberately not exposed — they do not apply to us.
+# ------------------------------------------------------------------------------
+core:
+
+  # OpenShift = true for every cluster today. Set false on vanilla clusters,
+  # which also switches Route -> Ingress (see manager.ingress below).
+  openshift: true
+
+  # ---- images -----------------------------------------------------------------
+  # All images are mirrored into Harbor. `registry` is global; `repository`
+  # carries the project path. Result: registry.x.com/internal-images/controller
+  registry: registry.x.com
+  # tag applies to controller + enforcer + manager only.
+  tag: "5.6.0"
+
+  # Single string, NOT a list — this is the upstream contract.
+  imagePullSecrets: dcs-neuvector-registry
+
+  # ---- RBAC / service accounts -------------------------------------------------
+  rbac: true
+  psp: false
+  # true -> dedicated SAs per component (basic, controller, enforcer, scanner,
+  # updater, registry-adapter, cert-upgrader) instead of one shared SA.
+  # Keep true; dcs.openshiftSCC binds the right SCC to each.
+  leastPrivilege: true
+  # Only consulted when leastPrivilege=false.
+  serviceAccount: default
+
+  # ---- certificates ------------------------------------------------------------
+  # autoGenerateCert MUST stay false under ArgoCD.
+  # The upstream helper regenerates a self-signed cert on every `helm template`
+  # when it cannot `lookup` the live secret (which Argo cannot), producing a
+  # permanent OutOfSync diff and a rolling restart on every sync. We supply the
+  # manager cert from a SealedSecret and let controller/scanner fall back to the
+  # certs baked into the images for their own REST endpoints.
+  autoGenerateCert: false
+  defaultValidityPeriod: 365
+
+  internal:
+    # Component-to-component mTLS issued by cert-manager. This creates a
+    # self-signed Issuer + CA Certificate `neuvector-internal` INSIDE the
+    # namespace — it does not use (and does not need) the org ClusterIssuer.
+    # Chosen over the built-in rotation because the Certificate CR is
+    # declarative in git while the resulting Secret is not, so Argo sees no drift.
+    certmanager:
+      enabled: true
+      secretname: dcs-neuvector-internal-certs
+    autoGenerateCert: false
+    autoRotateCert: false
+
+  # ---- controller --------------------------------------------------------------
+  controller:
+    enabled: true
+    replicas: 3
+    disruptionbudget: 2
+    strategy:
+      type: RollingUpdate
+      rollingUpdate:
+        maxSurge: 1
+        maxUnavailable: 0
+    image:
+      repository: internal-images/controller
+      imagePullPolicy: IfNotPresent
+      hash:
+    annotations: {}
+    podLabels: {}
+    podAnnotations: {}
+    env: []
+    schedulerName:
+    priorityClassName:
+    nodeSelector: {}
+    tolerations: []
+    topologySpreadConstraints: []
+    affinity:
+      podAntiAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values:
+                      - neuvector-controller-pod
+              topologyKey: "kubernetes.io/hostname"
+    resources:
+      requests:
+        cpu: 200m
+        memory: 1Gi
+      limits:
+        cpu: "1"
+        memory: 2Gi
+
+    # Rancher-only. Never enabled here.
+    ranchersso:
+      enabled: false
+
+    # Persist controller config/state so a full cluster restart does not lose
+    # policy, users or federation state. Requires an RWX StorageClass.
+    pvc:
+      enabled: true
+      existingClaim: false
+      accessModes:
+        - ReadWriteMany
+      storageClass: ""
+      capacity: 10Gi
+
+    # Externally exposed controller REST API (10443). Not exposed today —
+    # tenants and admins use the UI; automation talks to it in-cluster.
+    apisvc:
+      ctrlServerPort: 10443
+      # empty = no Service/Route created
+      type:
+      annotations: {}
+      nodePort:
+      route:
+        enabled: false
+        termination: passthrough
+        host:
+
+    # External TLS for the controller REST API and both federation endpoints —
+    # one cert serves all three, because all three are served by the controller
+    # pod. Federation itself does not verify this cert (it skips transport
+    # verification and runs its own mTLS from the join exchange), so this exists
+    # for REST API clients: admins, CI pipelines, and anything we expose later.
+    certificate:
+      secret: dcs-neuvector-external-certs
+      keyFile: tls.key
+      pemFile: tls.crt
+
+    # Internal mTLS — must point at the cert-manager secret above, otherwise the
+    # upstream template renders an empty secretName.
+    internal:
+      certificate:
+        secret: dcs-neuvector-internal-certs
+        keyFile: tls.key
+        pemFile: tls.crt
+        caFile: ca.crt
+
+    # ---- federation ----
+    # role=hub      -> mastersvc.type + mastersvc.route.enabled
+    # role=managed  -> managedsvc.type + managedsvc.route.enabled
+    # role=standalone -> both off (below)
+    # Passthrough Routes terminate on the router at :443, so the port the peer
+    # dials is 443 — NOT 11443/10443. Reflect that in fedinitcfg.yaml.
+    federation:
+      mastersvc:
+        # empty = not a federation primary; set to ClusterIP on the hub
+        type:
+        loadBalancerIP:
+        clusterIP:
+        nodePort:
+        externalTrafficPolicy:
+        internalTrafficPolicy:
+        annotations: {}
+        route:
+          enabled: false
+          termination: passthrough
+          host:
+        ingress:
+          enabled: false
+          host:
+          ingressClassName: ""
+          path: "/"
+          annotations:
+            nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+          tls: false
+          secretName:
+      managedsvc:
+        # empty = not a federation remote; set to ClusterIP on managed clusters
+        type:
+        loadBalancerIP:
+        clusterIP:
+        nodePort:
+        externalTrafficPolicy:
+        internalTrafficPolicy:
+        annotations: {}
+        route:
+          enabled: false
+          termination: passthrough
+          host:
+        ingress:
+          enabled: false
+          host:
+          ingressClassName: ""
+          path: "/"
+          annotations:
+            nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+          tls: false
+          secretName:
+
+    # Vanilla-cluster ingress for the controller API. Off.
+    ingress:
+      enabled: false
+      host:
+      ingressClassName: ""
+      path: "/"
+      annotations:
+        nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+      tls: false
+      secretName:
+
+    # We own neuvector-init (ConfigMap + SealedSecret), so the subchart's own
+    # generators stay OFF. Turning either on would collide on the object name.
+    configmap:
+      enabled: false
+      data: {}
+    secret:
+      enabled: false
+      data: {}
+
+    # Internal-cert rotation cronjob. Unused because cert-manager owns the CA.
+    certupgrader:
+      schedule: ""
+      imagePullPolicy: IfNotPresent
+      timeout: 3600
+      env: []
+      priorityClassName:
+      podLabels: {}
+      podAnnotations: {}
+      tolerations: []
+      nodeSelector: {}
+      runAsUser:
+      resources:
+        requests:
+          cpu: 50m
+          memory: 128Mi
+        limits:
+          cpu: 200m
+          memory: 256Mi
+
+  # ---- enforcer ----------------------------------------------------------------
+  enforcer:
+    enabled: true
+    image:
+      repository: internal-images/enforcer
+      imagePullPolicy: IfNotPresent
+      hash:
+    updateStrategy:
+      type: RollingUpdate
+    priorityClassName:
+    podLabels: {}
+    podAnnotations: {}
+    env: []
+    # DaemonSet must cover every node, including control-plane and infra.
+    tolerations:
+      - operator: Exists
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: "1"
+        memory: 2Gi
+    internal:
+      certificate:
+        secret: dcs-neuvector-internal-certs
+        keyFile: tls.key
+        pemFile: tls.crt
+        caFile: ca.crt
+    # Required: the enforcer inspects the host runtime and network namespaces.
+    securityContext:
+      privileged: true
+
+  # ---- manager (Web UI) ---------------------------------------------------------
+  manager:
+    enabled: true
+    image:
+      repository: internal-images/manager
+      imagePullPolicy: IfNotPresent
+      hash:
+    priorityClassName:
+    env:
+      # true = the manager pod terminates TLS itself. Mandatory for a
+      # passthrough Route; set false only if you switch to edge termination.
+      ssl: true
+      envs: []
+    svc:
+      mgrServerPort: 8443
+      type: ClusterIP
+      nodePort:
+      loadBalancerIP:
+      annotations: {}
+    # OpenShift exposure. host MUST be set per environment and MUST match the
+    # SAN of the certificate in dcs.secrets.managerTls (no wildcards allowed).
+    route:
+      enabled: true
+      termination: passthrough
+      host: ""
+    # Vanilla-cluster exposure (openshift=false).
+    ingress:
+      enabled: false
+      host:
+      ingressClassName: ""
+      path: "/"
+      annotations: {}
+      tls: false
+      secretName:
+    # Externally signed UI certificate, delivered as a SealedSecret.
+    # keyFile/pemFile are the KEYS INSIDE that secret — kubeseal/cert-manager
+    # convention is tls.key + tls.crt, so we override the upstream tls.pem.
+    certificate:
+      secret: dcs-neuvector-external-certs
+      keyFile: tls.key
+      pemFile: tls.crt
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+    podLabels: {}
+    podAnnotations: {}
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+    topologySpreadConstraints: []
+    runAsUser:
+    probes:
+      enabled: true
+      timeout: 1
+      periodSeconds: 10
+      startupFailureThreshold: 30
+
+  # ---- scanning ------------------------------------------------------------------
+  cve:
+
+    # Harbor pluggable-scanner adapter. Hub only (Harbor lives on the hub), and
+    # only once we decide to surface results in the Harbor UI. Off by default.
+    adapter:
+      enabled: false
+      image:
+        repository: internal-images/registry-adapter
+        imagePullPolicy: IfNotPresent
+        tag: "0.2.9"
+        hash:
+      priorityClassName:
+      podLabels: {}
+      podAnnotations: {}
+      env: []
+      nodeSelector: {}
+      tolerations: []
+      affinity: {}
+      runAsUser:
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          cpu: 500m
+          memory: 1Gi
+      harbor:
+        protocol: https
+        # Basic-auth credentials Harbor presents TO the adapter. We generate
+        # them, seal them (dcs.secrets.adapterAuth), and type the same pair into
+        # Harbor: Administration -> Interrogation Services -> + NEW SCANNER.
+        # Secret keys must be exactly `username` and `password`.
+        secretName: dcs-neuvector-adapter-auth
+      # Server cert presented to Harbor. Issued for the in-cluster Service DNS
+      # names by dcs.adapter.inClusterCert. Point this at
+      # dcs-neuvector-external-certs instead only if you expose the adapter via
+      # a Route (the qa-hub CSR already carries that SAN).
+      certificate:
+        secret: dcs-neuvector-adapter-certs
+        keyFile: tls.key
+        pemFile: tls.crt
+      internal:
+        certificate:
+          secret: dcs-neuvector-internal-certs
+          keyFile: tls.key
+          pemFile: tls.crt
+          caFile: ca.crt
+      svc:
+        type: ClusterIP
+        loadBalancerIP:
+        annotations: {}
+      route:
+        enabled: false
+        termination: passthrough
+        host:
+      ingress:
+        enabled: false
+        host:
+        ingressClassName: ""
+        path: "/"
+        annotations:
+          nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+        tls: false
+        secretName:
+
+    # The updater downloads NOTHING. It PATCHes the scanner Deployment with a
+    # restartedAt annotation so the pods re-pull the scanner image, and the CVE
+    # database ships INSIDE that image. Airgap therefore = Harbor replication of
+    # the scanner tag + imagePullPolicy: Always + this cron after the sync window.
+    updater:
+      enabled: true
+      # true = verify the in-cluster API server cert with the SA CA bundle.
+      secure: true
+      cacert: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+      image:
+        registry: ""
+        repository: internal-images/updater
+        imagePullPolicy: IfNotPresent
+        tag: "0.0.13"
+        hash:
+      # Harbor replication runs 02:00; restart scanners at 03:00.
+      schedule: "0 3 * * *"
+      priorityClassName:
+      podLabels: {}
+      podAnnotations: {}
+      nodeSelector: {}
+      tolerations: []
+      runAsUser:
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          cpu: 200m
+          memory: 128Mi
+
+    scanner:
+      enabled: true
+      replicas: 3
+      dockerPath: ""
+      strategy:
+        type: RollingUpdate
+        rollingUpdate:
+          maxSurge: 1
+          maxUnavailable: 0
+      image:
+        registry: ""
+        repository: internal-images/scanner
+        # MOVING tag on purpose. "6" is the major-version stream, refreshed
+        # daily upstream; it is NOT `latest`, so a disallow-latest-tag Kyverno
+        # policy passes. Combined with imagePullPolicy: Always + the updater
+        # cron, the CVE DB refreshes daily with zero git changes.
+        # Pin a dated tag (e.g. "4.245") only if policy forces immutable tags —
+        # you then own a daily values bump or the DB goes stale.
+        tag: "6"
+        imagePullPolicy: Always
+        hash:
+      priorityClassName:
+      podLabels: {}
+      podAnnotations: {}
+      env: []
+      nodeSelector: {}
+      tolerations: []
+      affinity: {}
+      topologySpreadConstraints: []
+      runAsUser:
+      volumes:
+      volumeMounts:
+      resources:
+        requests:
+          cpu: 200m
+          memory: 1Gi
+        limits:
+          cpu: "1"
+          memory: 2Gi
+      internal:
+        certificate:
+          secret: dcs-neuvector-internal-certs
+          keyFile: tls.key
+          pemFile: tls.crt
+          caFile: ca.crt
+
+  # ---- container runtime ---------------------------------------------------------
+  # 5.3.0+ auto-detects the runtime socket. Leave runtimePath empty for both
+  # OpenShift (CRI-O) and vanilla (containerd) at default socket locations;
+  # set it ONLY if a cluster uses a non-standard path.
+  runtimePath:
+  containerd:
+    enabled: false
+    path: /var/run/containerd/containerd.sock
+  crio:
+    enabled: false
+    path: /var/run/crio/crio.sock
+
+  # ---- webhooks / misc -----------------------------------------------------------
+  admissionwebhook:
+    type: ClusterIP
+  crdwebhooksvc:
+    enabled: true
+  crdwebhook:
+    enabled: true
+    type: ClusterIP
+  lease:
+    enabled: true
+
+  # Fallback resources for any component without its own block.
+  resources: {}

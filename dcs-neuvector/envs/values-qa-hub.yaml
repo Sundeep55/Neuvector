@@ -1,0 +1,95 @@
+# ==============================================================================
+# QA HUB — federation PRIMARY. Admin-only UI (LDAP later; local admin for now).
+# Lives in the hub app-of-apps repo under clusters/qa-hub/.
+# ==============================================================================
+
+dcs:
+  role: hub
+  clusterName: qa-hub
+
+  systemConfig:
+    alwaysReload: true
+    newServicePolicyMode: Discover
+    autoScan: false
+
+  secrets:
+    imagePull:
+      encryptedData:
+        .dockerconfigjson: REPLACE_WITH_KUBESEAL_OUTPUT
+    externalTls:
+      encryptedData:
+        tls.crt: REPLACE_WITH_KUBESEAL_OUTPUT
+        tls.key: REPLACE_WITH_KUBESEAL_OUTPUT
+    bootstrap:
+      encryptedData:
+        bootstrapPassword: REPLACE_WITH_KUBESEAL_OUTPUT
+    # Only needed when core.cve.adapter.enabled=true below.
+    adapterAuth:
+      enabled: false
+      # encryptedData:
+      #   username: REPLACE_WITH_KUBESEAL_OUTPUT
+      #   password: REPLACE_WITH_KUBESEAL_OUTPUT
+    # fedinitcfg.yaml carries the join token -> must be sealed.
+    #   scripts/seal.sh fedinit-primary qa-hub \
+    #     neuvector-fed.apps.ocp-qa-hub.x.com 443 <JOIN_TOKEN_UUID>
+    init:
+      enabled: true
+      encryptedData:
+        fedinitcfg.yaml: REPLACE_WITH_KUBESEAL_OUTPUT
+
+core:
+  openshift: true
+
+  controller:
+    replicas: 3
+    disruptionbudget: 2
+    pvc:
+      enabled: true
+      storageClass: ocs-storagecluster-cephfs
+      capacity: 10Gi
+    resources:
+      requests:
+        cpu: 300m
+        memory: 2Gi
+      limits:
+        cpu: "2"
+        memory: 4Gi
+
+    # ---- federation primary ---------------------------------------------------
+    # The Route is passthrough, so remote clusters dial :443 on the router, not
+    # :11443. That is the port that goes into the managed clusters' fedinitcfg.
+    federation:
+      mastersvc:
+        type: ClusterIP
+        route:
+          enabled: true
+          termination: passthrough
+          host: neuvector-fed.apps.ocp-qa-hub.x.com
+
+  enforcer:
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: "1"
+        memory: 2Gi
+
+  manager:
+    route:
+      enabled: true
+      termination: passthrough
+      host: neuvector.apps.ocp-qa-hub.x.com
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+
+  cve:
+    scanner:
+      replicas: 2
+    updater:
+      schedule: "0 3 * * *"

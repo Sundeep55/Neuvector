@@ -1,0 +1,28 @@
+{{- if .Values.dcs.systemConfig.enabled }}
+{{/*
+neuvector-init ConfigMap — the non-secret half of NeuVector's declarative
+bootstrap. The controller projects this together with the neuvector-init Secret
+onto /etc/config and applies each *initcfg.yaml at startup.
+
+IMPORTANT: a filename must appear in EITHER this ConfigMap OR the Secret, never
+both. They are merged through a projected volume and a duplicate path makes the
+controller pod fail to start.
+
+Owned here:        sysinitcfg.yaml   (no secrets)
+Owned by Secret:   fedinitcfg.yaml, ldapinitcfg.yaml, oidcinitcfg.yaml, roleinitcfg.yaml
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: neuvector-init
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{ include "dcs-neuvector.labels" . | indent 4 }}
+  {{- with .Values.dcs.commonAnnotations }}
+  annotations:
+{{ toYaml . | indent 4 }}
+  {{- end }}
+data:
+  sysinitcfg.yaml: |
+{{ include "dcs-neuvector.sysinitcfg" . | indent 4 }}
+{{- end }}

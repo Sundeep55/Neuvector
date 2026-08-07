@@ -1,0 +1,103 @@
+# ==============================================================================
+# PROD MANAGED (airgapped) — federation REMOTE. Tenant-facing.
+# Sized for the large environment: ~200 tenants / ~800 namespaces on this
+# cluster class. Treat as a starting point and re-measure.
+# ==============================================================================
+
+dcs:
+  role: managed
+  clusterName: prod-managed-01
+
+  systemConfig:
+    alwaysReload: true
+    newServicePolicyMode: Discover
+    noTelemetryReport: true
+    autoScan: false
+    allowNsUserExportNetPolicy: false
+    # Next release: flip these to migrate Discover -> Monitor -> Protect on a
+    # timer instead of by hand across 800 namespaces.
+    modeAuto:
+      discoverToMonitor: false
+      discoverToMonitorDuration: 604800     # 7 days
+      monitorToProtect: false
+      monitorToProtectDuration: 1209600     # 14 days
+
+  secrets:
+    imagePull:
+      encryptedData:
+        .dockerconfigjson: REPLACE_WITH_KUBESEAL_OUTPUT
+    externalTls:
+      encryptedData:
+        tls.crt: REPLACE_WITH_KUBESEAL_OUTPUT
+        tls.key: REPLACE_WITH_KUBESEAL_OUTPUT
+    bootstrap:
+      encryptedData:
+        bootstrapPassword: REPLACE_WITH_KUBESEAL_OUTPUT
+    init:
+      enabled: true
+      encryptedData:
+        fedinitcfg.yaml: REPLACE_WITH_KUBESEAL_OUTPUT
+
+core:
+  openshift: true
+
+  controller:
+    replicas: 3
+    disruptionbudget: 2
+    pvc:
+      enabled: true
+      storageClass: ocs-storagecluster-cephfs
+      capacity: 20Gi
+    # Controller memory scales with the number of workloads, groups and policy
+    # rules it holds in memory — 800 namespaces is the driver here, not traffic.
+    resources:
+      requests:
+        cpu: "1"
+        memory: 6Gi
+      limits:
+        cpu: "4"
+        memory: 12Gi
+    federation:
+      managedsvc:
+        type: ClusterIP
+        route:
+          enabled: true
+          termination: passthrough
+          host: neuvector-fed.apps.ocp-prod-mgd01.x.com
+
+  enforcer:
+    # Per node. Dense worker nodes need the higher limit; the enforcer holds
+    # per-container network and process state.
+    resources:
+      requests:
+        cpu: 500m
+        memory: 1Gi
+      limits:
+        cpu: "2"
+        memory: 4Gi
+
+  manager:
+    route:
+      enabled: true
+      termination: passthrough
+      host: neuvector.apps.ocp-prod-mgd01.x.com
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: "1"
+        memory: 2Gi
+
+  cve:
+    scanner:
+      replicas: 5
+      resources:
+        requests:
+          cpu: 500m
+          memory: 2Gi
+        limits:
+          cpu: "2"
+          memory: 4Gi
+    updater:
+      schedule: "0 3 * * *"

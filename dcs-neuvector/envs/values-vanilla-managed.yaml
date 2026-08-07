@@ -1,0 +1,92 @@
+# ==============================================================================
+# VANILLA KUBERNETES (non-OpenShift) managed cluster.
+#
+# Only three things differ from an OpenShift managed cluster:
+#   1. Ingress replaces Route
+#   2. no SCC bindings (the namespace needs Pod Security Admission labels instead)
+#   3. the container runtime socket may need an explicit path
+# Everything else — cert-manager internal certs, sealed secrets, federation,
+# the airgap scanner flow — is identical.
+#
+# PREREQUISITE on the namespace (set by the namespace-provisioning chart, not
+# here, because this chart does not create its own namespace):
+#   pod-security.kubernetes.io/enforce: privileged
+# The enforcer DaemonSet runs privileged with hostPID and is rejected outright
+# under the `restricted` or `baseline` PSA profiles.
+# ==============================================================================
+
+dcs:
+  role: managed
+  clusterName: vanilla-managed-01
+
+  systemConfig:
+    alwaysReload: true
+    newServicePolicyMode: Discover
+
+  secrets:
+    imagePull:
+      encryptedData:
+        .dockerconfigjson: REPLACE_WITH_KUBESEAL_OUTPUT
+    externalTls:
+      encryptedData:
+        tls.crt: REPLACE_WITH_KUBESEAL_OUTPUT
+        tls.key: REPLACE_WITH_KUBESEAL_OUTPUT
+    bootstrap:
+      encryptedData:
+        bootstrapPassword: REPLACE_WITH_KUBESEAL_OUTPUT
+    init:
+      enabled: true
+      encryptedData:
+        fedinitcfg.yaml: REPLACE_WITH_KUBESEAL_OUTPUT
+
+core:
+  # Switches Route -> Ingress and disables the SCC RoleBindings.
+  openshift: false
+
+  controller:
+    replicas: 3
+    disruptionbudget: 2
+    pvc:
+      enabled: true
+      storageClass: REPLACE_RWX_STORAGECLASS
+      capacity: 10Gi
+    federation:
+      managedsvc:
+        type: ClusterIP
+        # Route has no equivalent here; expose the federation endpoint with an
+        # Ingress. nginx needs ssl-passthrough because the controller speaks TLS
+        # and NeuVector pins its own mTLS on top.
+        ingress:
+          enabled: true
+          host: neuvector-fed.k8s-mgd01.x.com
+          ingressClassName: nginx
+          path: "/"
+          annotations:
+            nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+            nginx.ingress.kubernetes.io/ssl-passthrough: "true"
+          tls: false
+
+  manager:
+    route:
+      enabled: false
+    ingress:
+      enabled: true
+      host: neuvector.k8s-mgd01.x.com
+      ingressClassName: nginx
+      path: "/"
+      annotations:
+        # Set automatically from manager.env.ssl, repeated here for clarity.
+        nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+      # nginx terminates with our org cert and re-encrypts to the manager pod.
+      # The SAN must still match the host below.
+      tls: true
+      secretName: dcs-neuvector-external-certs
+
+  # Uncomment only if the containerd socket is not at the default location.
+  # runtimePath: /run/containerd/containerd.sock
+
+  cve:
+    scanner:
+      replicas: 3
+    updater:
+      schedule: "0 3 * * *"
