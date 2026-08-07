@@ -32,6 +32,14 @@ core:
 
   # ---- minimal footprint: one of everything -----------------------------------
   controller:
+    # REST API, exposed on every cluster for onboarding automation and CI.
+    # The host must be a SAN of dcs-neuvector-external-certs.
+    apisvc:
+      type: ClusterIP
+      route:
+        enabled: true
+        termination: passthrough
+        host: neuvector-api.apps.ocp-dev.x.com
     replicas: 1
     disruptionbudget: 0
     pvc:

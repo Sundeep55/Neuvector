@@ -44,6 +44,21 @@ core:
   openshift: false
 
   controller:
+    # REST API. No Route on vanilla — use the controller Ingress, and turn the
+    # Route off so validate.yaml is satisfied.
+    apisvc:
+      type: ClusterIP
+      route:
+        enabled: false
+    ingress:
+      enabled: true
+      host: neuvector-api.k8s-mgd01.x.com
+      ingressClassName: nginx
+      path: "/"
+      annotations:
+        nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+      tls: true
+      secretName: dcs-neuvector-external-certs
     replicas: 3
     disruptionbudget: 2
     pvc:

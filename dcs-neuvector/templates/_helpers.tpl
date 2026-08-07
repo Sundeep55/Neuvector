@@ -9,49 +9,34 @@
 {{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
-{{/* Labels stamped on every object this wrapper owns. */}}
+{{/*
+Target namespace. Declared explicitly as dcs.namespace to match how the other
+NaaS components are configured, defaulting to the release namespace.
+
+The upstream subchart hardcodes .Release.Namespace in its own templates, so the
+two MUST agree — validate.yaml fails the render if they do not.
+*/}}
+{{- define "dcs-neuvector.namespace" -}}
+{{- default .Release.Namespace .Values.dcs.namespace -}}
+{{- end -}}
+
+{{/*
+Labels stamped on objects this wrapper owns.
+
+Deliberately minimal. Not set here, because something else owns them:
+  app.kubernetes.io/instance  -> ArgoCD's default instanceLabelKey; setting it
+                                 ourselves can collide with app tracking
+  app.kubernetes.io/managed-by -> only set by the Helm CLI; ArgoCD renders with
+                                 `helm template`, so it would be inaccurate
+*/}}
 {{- define "dcs-neuvector.labels" -}}
 app.kubernetes.io/name: {{ include "dcs-neuvector.name" . }}
-app.kubernetes.io/instance: {{ .Release.Name }}
-app.kubernetes.io/managed-by: {{ .Release.Service }}
 app.kubernetes.io/part-of: neuvector
 helm.sh/chart: {{ include "dcs-neuvector.chart" . }}
 dcs.io/cluster-role: {{ .Values.dcs.role }}
 {{- with .Values.dcs.commonLabels }}
 {{ toYaml . }}
 {{- end }}
-{{- end -}}
-
-{{- define "dcs-neuvector.annotations" -}}
-{{- with .Values.dcs.commonAnnotations }}
-{{ toYaml . }}
-{{- end }}
-{{- end -}}
-
-{{/* ---------------------------------------------------------------------- */}}
-{{/* Service accounts that need SCC access.                                  */}}
-{{/* leastPrivilege=true creates one SA per component; otherwise everything   */}}
-{{/* runs under core.serviceAccount.                                          */}}
-{{/* ---------------------------------------------------------------------- */}}
-
-{{/* SAs needing the privileged SCC (hostPID + privileged container). */}}
-{{- define "dcs-neuvector.privilegedServiceAccounts" -}}
-{{- if .Values.core.leastPrivilege -}}
-enforcer
-{{- else -}}
-{{ .Values.core.serviceAccount }}
-{{- end -}}
-{{- end -}}
-
-{{/* SAs needing anyuid (controller runs as uid 0; the rest want a stable UID). */}}
-{{- define "dcs-neuvector.standardServiceAccounts" -}}
-{{- if .Values.core.leastPrivilege -}}
-{{- $sas := list "basic" "controller" "scanner" "updater" "cert-upgrader" -}}
-{{- if .Values.core.cve.adapter.enabled -}}
-{{- $sas = append $sas "registry-adapter" -}}
-{{- end -}}
-{{- join "," $sas -}}
-{{- end -}}
 {{- end -}}
 
 {{/* ---------------------------------------------------------------------- */}}

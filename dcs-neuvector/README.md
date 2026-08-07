@@ -13,7 +13,7 @@ dcs-neuvector/
 │   ├── validate.yaml             render-time guardrails (fail fast in ArgoCD)
 │   ├── configmap-init.yaml       neuvector-init ConfigMap (sysinitcfg.yaml)
 │   ├── sealedsecrets.yaml        all credentials, map-driven
-│   ├── openshift-scc-rbac.yaml   SCC access the upstream chart does not create
+│   ├── certificate-adapter.yaml  in-cluster TLS for the Harbor adapter
 │   └── _helpers.tpl
 ├── docs/initcfg/                 full field reference for every *initcfg.yaml
 ├── docs/registry-automation.md   registry setup via REST API (no CRD exists)
@@ -89,12 +89,39 @@ Paste each block under the matching `dcs.secrets.<name>.encryptedData` in the
 environment values file. A secret whose `encryptedData` is empty is simply not
 rendered, so the chart installs cleanly before every credential exists.
 
+Sealing is strict-scoped — kubeseal's default — so a blob is bound to this exact
+namespace and secret name, matching how sealed secrets are made for the other
+NaaS components.
+
 | secret | object | contents |
 |---|---|---|
 | `imagePull` | `dcs-neuvector-registry` | Harbor pull creds |
+| `adapterAuth` | `dcs-neuvector-adapter-auth` | basic-auth pair Harbor uses to call the registry adapter (hub only) |
 | `externalTls` | `dcs-neuvector-external-certs` | one multi-SAN cert: UI + controller API + fed (+ adapter on hub) |
 | `bootstrap` | `neuvector-bootstrap-secret` | initial local `admin` password (name fixed by NeuVector) |
 | `init` | `neuvector-init` (name fixed by NeuVector) | `fedinitcfg.yaml` today; `ldap/oidc/roleinitcfg.yaml` next iteration |
+
+## Namespace
+
+`dcs.namespace` declares the target namespace, consistent with the other NaaS
+components. It defaults to the release namespace and **must equal it**: the
+upstream subchart hardcodes `.Release.Namespace` in its own templates, so a
+mismatch would put our SealedSecrets and ConfigMap somewhere NeuVector cannot
+read them — with no error at apply time, just a controller that silently ignores
+its configuration. `validate.yaml` fails the render instead.
+
+## Labels
+
+Deliberately minimal: `app.kubernetes.io/name`, `app.kubernetes.io/part-of`,
+`helm.sh/chart`, `dcs.io/cluster-role`. Two common ones are **not** set here:
+
+- `app.kubernetes.io/instance` — ArgoCD's default `instanceLabelKey`. Setting it
+  ourselves risks colliding with application tracking.
+- `app.kubernetes.io/managed-by` — only added by the Helm CLI. ArgoCD renders
+  with `helm template`, so Helm adds nothing at all and the label would be a lie;
+  ArgoCD applies its own tracking label or annotation.
+
+`dcs.commonLabels` / `dcs.commonAnnotations` remain as escape hatches.
 
 ## Decisions worth knowing
 
@@ -162,11 +189,17 @@ Two other names are fixed by NeuVector itself and cannot be prefixed:
 `neuvector-init` (projected by name into the controller) and
 `neuvector-bootstrap-secret` (read by name through the API).
 
-**SCC.** The upstream chart creates no SCC and no binding. At 5.6 the enforcer
-needs `privileged` (hostPID + privileged container) and the controller needs
-`anyuid` (`runAsUser: 0`); the rest take `anyuid` for a stable UID.
-`openshift-scc-rbac.yaml` grants these through RBAC, the declarative equivalent
-of `oc adm policy add-scc-to-user`.
+**SCC is upstream's job, not ours.** With `openshift: true` *and*
+`leastPrivilege: true` the subchart already emits the right wiring:
+a `system:openshift:scc:privileged` RoleBinding for the **enforcer SA only**, and
+a purpose-built restrictive SCC `neuvector-scc-controller` (no privileged, no
+hostPID, `RunAsAny` uid) bound to the controller SA. Everything else runs under
+the default `restricted-v2`.
+
+This chart previously added its own bindings granting `anyuid` more broadly —
+that was removed, because it was both redundant and weaker than what upstream
+already does. If you ever set `leastPrivilege: false`, none of this is generated
+and you are back to needing manual `oc adm policy add-scc-to-user`.
 
 **`neuvector-init` is owned by this chart**, split across a plain ConfigMap
 (`sysinitcfg.yaml`, no secrets, diffable in git) and a SealedSecret (everything

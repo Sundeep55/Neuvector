@@ -41,6 +41,14 @@ core:
   openshift: true
 
   controller:
+    # REST API, exposed on every cluster for onboarding automation and CI.
+    # The host must be a SAN of dcs-neuvector-external-certs.
+    apisvc:
+      type: ClusterIP
+      route:
+        enabled: true
+        termination: passthrough
+        host: neuvector-api.apps.ocp-qa-hub.x.com
     replicas: 3
     disruptionbudget: 2
     pvc:

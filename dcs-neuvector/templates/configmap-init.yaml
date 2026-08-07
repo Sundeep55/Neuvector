@@ -15,7 +15,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: neuvector-init
-  namespace: {{ .Release.Namespace }}
+  namespace: {{ include "dcs-neuvector.namespace" . }}
   labels:
 {{ include "dcs-neuvector.labels" . | indent 4 }}
   {{- with .Values.dcs.commonAnnotations }}

@@ -55,7 +55,10 @@ Every subsequent call carries `X-Auth-Token: $TOKEN`
 sessions, and a Job that leaks one per run will pile them up.
 
 In-cluster the API is `https://neuvector-svc-controller-api.dcs-neuvector.svc:10443`,
-so a Job needs no external Route.
+which is what an onboarding Job should use. The API is also exposed externally on
+every cluster (`core.controller.apisvc.route.enabled`, host
+`neuvector-api.<cluster-domain>`, covered by a SAN of
+`dcs-neuvector-external-certs`) for admin tooling and customer pipelines.
 
 ## Payload
 
@@ -128,9 +131,38 @@ be federal or must be per-cluster `user_created`. Worth testing in QA once the
 hub and one managed cluster are federated — it is a 15-minute test with a real
 answer, and it changes the onboarding design.
 
+## Two credentials, opposite directions — do not confuse them
+
+| | NeuVector-side registry scanning | Harbor pluggable-scanner adapter |
+|---|---|---|
+| who calls whom | NeuVector crawls Harbor | Harbor calls the adapter |
+| credential | Harbor **robot account** (`username`/`password` in the registry config) | `cve.adapter.harbor.secretName` — a basic-auth pair **we invent** |
+| direction | outbound, NeuVector authenticates to Harbor | **inbound**, the adapter authenticates Harbor |
+| long-lived Harbor account needed? | **yes** | **no** |
+| where configured | `POST /v1/scan/registry` | Harbor: Interrogation Services -> + NEW SCANNER -> Basic Auth |
+
+The adapter's `authenticateHarbor` middleware wraps all three of its endpoints
+(`metadata`, `scan`, scan report) and compares each incoming request's basic-auth
+header against `HARBOR_BASIC_AUTH_USERNAME` / `HARBOR_BASIC_AUTH_PASSWORD`
+(`server/server.go`). It is a shared secret between Harbor's scanner
+registration and the adapter Deployment, nothing more.
+
+It is effectively mandatory: with the env vars unset, a request arriving without
+an `Authorization` header falls through the middleware without being served and
+without an error, producing an empty `200` — so Harbor's health check never turns
+green and the failure looks like a connectivity problem rather than a missing
+credential.
+
+And the adapter needs **no Harbor robot account**: every scan request Harbor
+sends carries `Registry.URL` plus a short-lived `Registry.Authorization` token,
+which the adapter forwards to the controller as the pull credential for that one
+image. So if you go adapter-only and drop NeuVector-side registry scanning, the
+robot account below is not needed at all.
+
 ## Harbor robot permissions
 
-One **system-level** robot, read-only, never shared with tenants:
+Needed for the **NeuVector-side** registry scanning path only (see the table
+above). One **system-level** robot, read-only, never shared with tenants:
 
 - list projects, list repositories, list artifacts/tags
 - **pull** (the scanner downloads and unpacks the image)

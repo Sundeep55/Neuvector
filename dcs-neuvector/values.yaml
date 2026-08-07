@@ -19,6 +19,14 @@
 # ------------------------------------------------------------------------------
 dcs:
 
+  # Target namespace, declared explicitly to match the other NaaS components.
+  # Empty falls back to the release namespace (what ArgoCD sets from the
+  # Application destination). The upstream subchart hardcodes .Release.Namespace
+  # in its own templates, so if this is set it MUST equal the release namespace
+  # — validate.yaml fails the render otherwise, rather than scattering our
+  # objects into a different namespace from NeuVector's own.
+  namespace: dcs-neuvector
+
   # Cluster role in the hub-and-spoke topology.
   #   standalone -> single cluster, no federation           (dev)
   #   hub        -> federation PRIMARY, admins only          (qa-hub, prod-hub)
@@ -99,8 +107,8 @@ dcs:
   # SealedSecrets. encryptedData is filled in per cluster by scripts/seal.sh.
   # A secret with an empty encryptedData map is simply NOT rendered, so this
   # chart installs cleanly in dev before every credential exists.
-  # scope: strict (default) | namespace-wide | cluster-wide — must match how the
-  # blob was sealed by kubeseal.
+  # Sealed strict-scoped (kubeseal's default): each blob is bound to this exact
+  # namespace + secret name.
   # ----------------------------------------------------------------------------
   secrets:
 
@@ -109,7 +117,6 @@ dcs:
       enabled: true
       name: dcs-neuvector-registry
       type: kubernetes.io/dockerconfigjson
-      scope: strict
       encryptedData: {}
       #  .dockerconfigjson: AgB...
 
@@ -124,7 +131,6 @@ dcs:
       enabled: true
       name: dcs-neuvector-external-certs
       type: kubernetes.io/tls
-      scope: strict
       encryptedData: {}
       #  tls.crt: AgB...   (leaf + intermediates, in that order)
       #  tls.key: AgB...
@@ -136,7 +142,6 @@ dcs:
       enabled: true
       name: neuvector-bootstrap-secret
       type: Opaque
-      scope: strict
       encryptedData: {}
       #  bootstrapPassword: AgB...
 
@@ -156,7 +161,6 @@ dcs:
       enabled: true
       name: neuvector-init
       type: Opaque
-      scope: strict
       encryptedData: {}
       #  fedinitcfg.yaml: AgB...
 
@@ -166,7 +170,6 @@ dcs:
       enabled: true
       name: dcs-neuvector-adapter-auth
       type: Opaque
-      scope: strict
       encryptedData: {}
       #  username: AgB...
       #  password: AgB...
@@ -178,7 +181,6 @@ dcs:
   #    enabled: true
   #    name: neuvector-harbor-robot
   #    type: Opaque
-  #    scope: strict
   #    encryptedData:
   #      username: AgB...
   #      password: AgB...
@@ -204,21 +206,9 @@ dcs:
       renewBefore: 720h    # 30 days
       extraDnsNames: []
 
-  # ----------------------------------------------------------------------------
-  # OpenShift SecurityContextConstraints access.
-  # The upstream chart does NOT create or bind any SCC. Requirements at 5.6:
-  #   enforcer   -> hostPID + privileged  => `privileged` SCC
-  #   controller -> runAsUser: 0          => `anyuid` SCC
-  #   others     -> `anyuid` (stable UID, avoids the random-UID reassignment)
-  # Bound via RBAC (RoleBinding -> system:openshift:scc:<name>), which is the
-  # declarative equivalent of `oc adm policy add-scc-to-user`.
-  # ----------------------------------------------------------------------------
-  openshiftSCC:
-    create: true
-    privilegedSCC: privileged
-    standardSCC: anyuid
-
-  # Extra labels/annotations stamped on every object this wrapper creates.
+  # Optional extra labels/annotations on the objects this wrapper creates.
+  # ArgoCD supplies its own tracking label; Helm adds nothing under `helm
+  # template`, so anything you want beyond the chart defaults goes here.
   commonLabels: {}
   commonAnnotations: {}
 
@@ -251,7 +241,13 @@ core:
   psp: false
   # true -> dedicated SAs per component (basic, controller, enforcer, scanner,
   # updater, registry-adapter, cert-upgrader) instead of one shared SA.
-  # Keep true; dcs.openshiftSCC binds the right SCC to each.
+  #
+  # Keep true. On OpenShift it also makes the upstream chart create the correct
+  # SCC wiring by itself: a RoleBinding granting the `privileged` SCC to the
+  # enforcer SA only, plus a purpose-built restrictive SCC
+  # (`neuvector-scc-controller`: no privileged, no hostPID, RunAsAny uid) bound
+  # to the controller SA. Every other component runs under the default
+  # restricted-v2. Set leastPrivilege=false and you lose all of that.
   leastPrivilege: true
   # Only consulted when leastPrivilege=false.
   serviceAccount: default
@@ -335,18 +331,21 @@ core:
       storageClass: ""
       capacity: 10Gi
 
-    # Externally exposed controller REST API (10443). Not exposed today —
-    # tenants and admins use the UI; automation talks to it in-cluster.
+    # Controller REST API (10443). Enabled and exposed on every cluster: it is
+    # how registry and tenant onboarding automation talks to NeuVector, and how
+    # customer pipelines would submit CI scans. The certificate already carries
+    # the matching SAN (see ../csr/), so exposure is a values-only decision.
     apisvc:
       ctrlServerPort: 10443
-      # empty = no Service/Route created
-      type:
+      type: ClusterIP
       annotations: {}
       nodePort:
+      # OpenShift. host MUST be set per environment and MUST match a SAN of
+      # dcs-neuvector-external-certs.
       route:
-        enabled: false
+        enabled: true
         termination: passthrough
-        host:
+        host: ""
 
     # External TLS for the controller REST API and both federation endpoints —
     # one cert serves all three, because all three are served by the controller
@@ -419,7 +418,8 @@ core:
           tls: false
           secretName:
 
-    # Vanilla-cluster ingress for the controller API. Off.
+    # Vanilla-cluster equivalent of apisvc.route above: enable on non-OpenShift
+    # clusters and set the host.
     ingress:
       enabled: false
       host:
@@ -582,9 +582,20 @@ core:
           memory: 1Gi
       harbor:
         protocol: https
-        # Basic-auth credentials Harbor presents TO the adapter. We generate
-        # them, seal them (dcs.secrets.adapterAuth), and type the same pair into
-        # Harbor: Administration -> Interrogation Services -> + NEW SCANNER.
+        # INBOUND credential: the adapter is an HTTP server and Harbor is its
+        # client. These land in the pod as HARBOR_BASIC_AUTH_USERNAME/PASSWORD,
+        # and the adapter's authenticateHarbor middleware compares every
+        # incoming request's basic-auth header against them (server/server.go).
+        # We invent the pair, seal it, and type the same values into Harbor:
+        # Administration -> Interrogation Services -> + NEW SCANNER -> Basic Auth.
+        #
+        # Effectively mandatory: with the env vars unset, requests without an
+        # Authorization header fall through the middleware and get an empty 200,
+        # so Harbor's health check never goes green.
+        #
+        # NOT a Harbor pull credential. Each scan request carries its own
+        # short-lived registry token from Harbor, which the adapter forwards to
+        # the controller — so this path needs no long-lived Harbor robot.
         # Secret keys must be exactly `username` and `password`.
         secretName: dcs-neuvector-adapter-auth
       # Server cert presented to Harbor. Issued for the in-cluster Service DNS

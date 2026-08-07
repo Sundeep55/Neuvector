@@ -7,6 +7,14 @@ failure mode we can actually hit with this topology.
 {{- $role := .Values.dcs.role -}}
 {{- $fed := .Values.core.controller.federation -}}
 
+{{/* 0. dcs.namespace is our declared namespace, but the subchart hardcodes
+      .Release.Namespace. If they disagree, our SealedSecrets and ConfigMap land
+      somewhere NeuVector cannot read them — and nothing would report an error
+      at apply time, only a controller that silently ignores its config. */}}
+{{- if and .Values.dcs.namespace (ne .Values.dcs.namespace .Release.Namespace) -}}
+{{- fail (printf "dcs.namespace (%s) must equal the release namespace (%s) — the upstream core subchart hardcodes .Release.Namespace, so the two cannot differ. Fix the ArgoCD Application destination namespace, or dcs.namespace." .Values.dcs.namespace .Release.Namespace) -}}
+{{- end -}}
+
 {{/* 1. Valid role */}}
 {{- if not (has $role (list "standalone" "hub" "managed")) -}}
 {{- fail (printf "dcs.role must be one of standalone|hub|managed, got %q" $role) -}}
@@ -55,10 +63,24 @@ failure mode we can actually hit with this topology.
   {{- end -}}
 {{- end -}}
 
+{{/* 5a. The controller REST API is exposed by default; its host must exist and
+      must be covered by a SAN of the external certificate. */}}
+{{- if and .Values.core.openshift .Values.core.controller.apisvc.route.enabled -}}
+  {{- if not .Values.core.controller.apisvc.type -}}
+  {{- fail "core.controller.apisvc.route.enabled=true requires core.controller.apisvc.type (e.g. ClusterIP) — the Route has no Service to point at otherwise" -}}
+  {{- end -}}
+  {{- if not .Values.core.controller.apisvc.route.host -}}
+  {{- fail "core.controller.apisvc.route.host is required when the controller API Route is enabled (it must match a SAN of dcs-neuvector-external-certs)" -}}
+  {{- end -}}
+{{- end -}}
+
 {{/* 5b. Vanilla clusters expose the UI through an Ingress instead of a Route. */}}
 {{- if not .Values.core.openshift -}}
-  {{- if .Values.core.manager.route.enabled -}}
-  {{- fail "core.manager.route.enabled=true but core.openshift=false — Routes do not exist on vanilla Kubernetes; use core.manager.ingress instead" -}}
+  {{- if or .Values.core.manager.route.enabled .Values.core.controller.apisvc.route.enabled -}}
+  {{- fail "a Route is enabled but core.openshift=false — Routes do not exist on vanilla Kubernetes; use core.manager.ingress / core.controller.ingress instead" -}}
+  {{- end -}}
+  {{- if and .Values.core.controller.ingress.enabled (not .Values.core.controller.ingress.host) -}}
+  {{- fail "core.controller.ingress.host is required when the controller API Ingress is enabled" -}}
   {{- end -}}
   {{- if .Values.core.manager.ingress.enabled -}}
     {{- if not .Values.core.manager.ingress.host -}}
