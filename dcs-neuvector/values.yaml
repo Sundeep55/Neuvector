@@ -580,7 +580,14 @@ core:
         limits:
           cpu: 500m
           memory: 1Gi
+      # Harbor reaches the adapter at:
+      #   https://<host>:9443/endpoint        (in-cluster Service DNS)
+      #   https://<route-host>/endpoint       (passthrough Route -> router :443)
+      # The /endpoint suffix is mandatory — the adapter serves
+      # /endpoint/api/v1/{metadata,scan} and 404s everything else.
+      # Full setup and failure-mode table: docs/harbor-adapter.md
       harbor:
+        # https -> pod listens on 9443; http -> 8090 and no TLS at all.
         protocol: https
         # INBOUND credential: the adapter is an HTTP server and Harbor is its
         # client. These land in the pod as HARBOR_BASIC_AUTH_USERNAME/PASSWORD,

@@ -17,6 +17,7 @@ dcs-neuvector/
 │   └── _helpers.tpl
 ├── docs/initcfg/                 full field reference for every *initcfg.yaml
 ├── docs/registry-automation.md   registry setup via REST API (no CRD exists)
+├── docs/harbor-adapter.md        registering the adapter in Harbor + failure modes
 ├── envs/                         worked per-environment overlays
 └── scripts/
     ├── seal.sh                   produce encryptedData blobs

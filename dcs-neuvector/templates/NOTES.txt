@@ -22,6 +22,14 @@ dcs-neuvector {{ .Chart.Version }}  (NeuVector {{ .Chart.AppVersion }}, core-2.1
   fed-managed    : https://{{ .Values.core.controller.federation.managedsvc.route.host }}:443
 {{- end }}
 
+{{- if .Values.core.cve.adapter.enabled }}
+
+Harbor scanner registration (Administration -> Interrogation Services -> + NEW SCANNER):
+  Endpoint : {{ if .Values.core.cve.adapter.route.enabled }}https://{{ .Values.core.cve.adapter.route.host }}/endpoint{{ else }}https://neuvector-service-registry-adapter.{{ include "dcs-neuvector.namespace" . }}.svc.cluster.local:9443/endpoint{{ end }}
+  Auth     : Basic, from secret {{ .Values.dcs.secrets.adapterAuth.name }}
+  The /endpoint suffix and the port are both required — see docs/harbor-adapter.md
+{{- end }}
+
 First login: user `admin`, password from the bootstrap secret:
 
   oc -n {{ include "dcs-neuvector.namespace" . }} get secret {{ .Values.dcs.secrets.bootstrap.name }} \
