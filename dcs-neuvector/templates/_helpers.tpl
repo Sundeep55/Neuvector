@@ -59,7 +59,11 @@ dcs.io/cluster-role: {{ .Values.dcs.role }}
       "Mode_Auto_M2P"                 $s.modeAuto.monitorToProtect
       "Mode_Auto_M2P_Duration"        $s.modeAuto.monitorToProtectDuration
       "Scan_Config"                   (dict "Auto_Scan" $s.autoScan)
+      "Enable_Tls_Verification"       $s.enableTlsVerification
 -}}
+{{- if $s.caCerts -}}
+{{- $_ := set $cfg "Cacerts" $s.caCerts -}}
+{{- end -}}
 {{- if $s.scannerAutoscale.strategy -}}
 {{- $_ := set $cfg "Scanner_Autoscale" (dict
       "Strategy" $s.scannerAutoscale.strategy

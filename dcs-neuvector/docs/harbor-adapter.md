@@ -124,9 +124,89 @@ invalid. Whatever the final host is, it must appear verbatim as a SAN in
 | adapter log `Unhandled HTTP Endpoint - endpoint=/api/v1/metadata` | Endpoint missing the `/endpoint` suffix |
 | Harbor `context deadline exceeded` | no `:9443` in the URL (went to 443) |
 | Harbor `x509: certificate signed by unknown authority` | Harbor does not trust the adapter's CA — tick skip-verify or add the CA. Connectivity is fine at this point |
+| Harbor `does not support scanning artifact with mime type ...` | almost always a failed metadata ping, not a mime problem — see "The mime-type error is a lie" |
 | Harbor `Forbidden` | an HTTP proxy refused `CONNECT`. Go surfaces a failed proxy CONNECT as an error whose text is the proxy's status line. Check `oc -n <harbor-ns> set env deploy/harbor-core --list \| grep -i -e proxy`, and make sure `NO_PROXY` covers the name you are dialling |
 | Harbor `invalid character ... looking for beginning of value` | the adapter requires basic auth but Harbor was registered with Authorization = None. With no `Authorization` header the middleware neither serves the request nor writes an error, so Go emits an empty `200` and Harbor fails to parse it |
 | browser shows an untrusted cert | the pod started before the cert secret existed and generated a self-signed one — restart the deployment |
+
+## The mime-type error is a lie
+
+```
+the configured scanner <name> does not support scanning artifact
+with mime type application/vnd.oci.image.manifest.v1+json
+```
+
+This almost never means what it says. The adapter *does* advertise that mime
+type — `server/server.go` returns
+`consumes_mime_types: [application/vnd.oci.image.manifest.v1+json,
+application/vnd.docker.distribution.manifest.v2+json]` — and Harbor's struct
+tags match it exactly, so the JSON parses correctly.
+
+Harbor reaches that message through:
+
+```go
+// src/controller/scan/checker.go
+func hasCapability(r *models.Registration, a *artifact.Artifact) bool {
+    allowlist := []string{image.ArtifactTypeImage}
+    if slices.Contains(allowlist, a.Type) {
+        return r.HasCapability(a.ManifestMediaType)
+    }
+    return false
+}
+
+// src/pkg/scan/dao/scanner/model.go
+func (r *Registration) HasCapability(mt string) bool {
+    if r.Metadata == nil { return false }     // <-- the usual culprit
+    ...
+}
+```
+
+So there are only two ways to see it:
+
+1. **`a.Type != image`** — the artifact is a Helm OCI chart, cosign signature or
+   SBOM attachment rather than an image. Ruled out if another scanner (Trivy)
+   scans the same artifact successfully.
+2. **`r.Metadata == nil`** — Harbor pings the adapter for metadata on *every*
+   scan (`Ping: true` is the default in `newOptions`) and, on failure, logs the
+   error, sets health to unhealthy and leaves `Metadata` nil. The scan then
+   reports a mime-type problem instead of the connection problem that actually
+   happened.
+
+### Finding the real error
+
+Harbor logs the true cause one line earlier, with a different prefix:
+
+```bash
+oc -n <harbor-ns> logs deploy/harbor-core | grep "api controller: get project scanner"
+```
+
+Or ask Harbor to fetch the metadata directly — this is the same `Ping` call the
+scan path makes:
+
+```bash
+curl -su <admin> https://registry.x.com/api/v2.0/scanners/<registration_id>/metadata
+```
+
+Healthy output contains `consumes_mime_types`. An error there is the real fault.
+
+### Why registration can succeed while scanning fails
+
+Registration runs the same ping, so a scanner that registered cleanly proves the
+ping worked *from whichever core pod handled that request, at that moment*. Two
+things break the symmetry:
+
+- **Multiple `harbor-core` replicas.** If the trusted-CA bundle was added and
+  only some pods restarted, registration may land on a good replica and scans on
+  a stale one. Restart every core replica, not just one.
+- **Adapter startup ordering.** The adapter blocks in
+  `for nvScanner.Version == "" { pollMaxConcurrent() }` *before* it registers any
+  handler or listens, so while the NeuVector controller is unreachable nothing is
+  listening on 9443 at all — connections are refused and the ping fails. The
+  adapter log shows `START - version=...` and then nothing.
+
+Note also that `getScannerAdapterMetadataWithCache` caches the **error**, not
+just the success, in a 30-second in-memory cache. Wait out the 30s before
+concluding a fix did not work.
 
 ## Prove the adapter before touching Harbor
 

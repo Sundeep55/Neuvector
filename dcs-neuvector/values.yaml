@@ -86,6 +86,31 @@ dcs:
     # groups. Turn on when tenant self-service lands.
     allowNsUserExportNetPolicy: false
 
+    # Verify TLS when NeuVector connects OUT to a registry (Harbor). Default in
+    # NeuVector is true, and it should stay true — turning it off to make a scan
+    # work is trading a real control for a five-minute fix.
+    # The correct fix is caCerts below.
+    enableTlsVerification: true
+
+    # PEM certificates NeuVector adds to its trust store for outbound registry
+    # connections (system config field `cacerts`, a list of PEM blocks).
+    #
+    # You do NOT need the whole org bundle here — only the chain that signed
+    # Harbor's certificate: its issuing intermediate and the root. Two entries.
+    # These are public certificates, so they belong in this plain ConfigMap and
+    # are fine in git.
+    #
+    #   caCerts:
+    #     - |
+    #       -----BEGIN CERTIFICATE-----
+    #       ... org root ...
+    #       -----END CERTIFICATE-----
+    #     - |
+    #       -----BEGIN CERTIFICATE-----
+    #       ... org issuing intermediate ...
+    #       -----END CERTIFICATE-----
+    caCerts: []
+
     # Auto-scan every newly discovered workload image. Costs scanner CPU; with
     # 800 namespaces enable deliberately, not by default.
     autoScan: false

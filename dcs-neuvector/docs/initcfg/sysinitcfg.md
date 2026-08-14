@@ -59,6 +59,47 @@ Note the interaction with our airgap setup: scanner pods use
 `imagePullPolicy: Always`, so every scale-up is a registry pull from Harbor.
 `delayed` avoids thrashing on short bursts.
 
+## Outbound TLS trust — `Enable_Tls_Verification` / `Cacerts`
+
+These govern the connection NeuVector makes **out** to a registry (Harbor). They
+are the fix for `x509: certificate signed by unknown authority` when NeuVector
+crawls a registry behind the org PKI.
+
+| field | values | default | meaning |
+|---|---|---|---|
+| `Enable_Tls_Verification` | bool | `true` | Verify the registry's server certificate. Keep it `true`. Turning it off makes the scan work while silently removing the control. |
+| `Cacerts` | list of PEM blocks | empty | Certificates added to NeuVector's trust store for those outbound connections. API field name `cacerts`. |
+
+**You do not need the whole org bundle.** `Cacerts` only has to contain the chain
+that signed *Harbor's* certificate — the issuing intermediate and its root. Two
+entries, not hundreds. These are public certificates, so they belong in the plain
+ConfigMap and are fine in git.
+
+Chart values: `dcs.systemConfig.enableTlsVerification` and
+`dcs.systemConfig.caCerts`.
+
+```yaml
+dcs:
+  systemConfig:
+    enableTlsVerification: true
+    caCerts:
+      - |
+        -----BEGIN CERTIFICATE-----
+        ... org root ...
+        -----END CERTIFICATE-----
+      - |
+        -----BEGIN CERTIFICATE-----
+        ... org issuing intermediate ...
+        -----END CERTIFICATE-----
+```
+
+This is a different mechanism from the OS trust store. Making the **controller**
+trust a private CA for OIDC/LDAP still means getting the bundle to
+`/etc/ssl/certs/ca-certificates.crt` (see [oidcinitcfg.md](oidcinitcfg.md)) —
+`Cacerts` does not affect that path. The upstream chart exposes
+`cve.scanner.volumes` / `cve.scanner.volumeMounts` for mounting extra material
+into the scanner, but there is no equivalent for the controller.
+
 ## Registry proxy
 
 Only relevant if scanning registries through an HTTP proxy. Irrelevant in the
