@@ -1,33 +1,58 @@
-Here are few more issues.
+Let me build you a single collector so this is one run and one paste-back.
 
-before i cover the issue you have to understand one thing on how we setup our root certificate trust in Harbor and other components, not sure if it is what we have to do but just for your info.
+Script is in and smoke-tested (it degrades gracefully when things are missing): [scripts/adapter-triage.sh](dcs-neuvector/scripts/adapter-triage.sh). Read-only, and it prints only SHA-256 prefixes of credentials so you can compare the two sides without pasting secrets anywhere.
 
-We have a org ca cert bundle which consists of all root and intermediate certs, so what we do is we create a config map in openshfit-config namespace and update cluster object for proxy to update the spec to have trustedCA with the config map name, so we run oc patch proxy cluster --type=merge --patch='{"spec":{"trustedCA":{"name": xxxx}}}'. next what we do is instead of copying and pasting the entire hughe bundlee of the root and inter certs, we create an emtpy  configmap with annotation config.openshift.io/inject-trusted-cabundle: true, this way the config map is filled with the entire root and inter cert chains. and next we simlpoy hook this config map to the component so it attains trust. for example we deploy harbor using public helm chart and we first convert the configmap to a secret and then use harbor.cabundlesecretname and add the new secret there so that moving forward harbor can attain trust from all urls which is signed by the org PKI. I had to tell all this because when i tried to add the registry adapter url to harbor scanner, it is failing with tls issue, so i had to add the cert manager Certificate ca.crt to the above mentioned config map and restart the harbor pods to start strusting, after which i was able to sccussfully add the registry adapter scanner to harbor, but then i had below issue #1 when runngin the scans using the new adapter, which is total failure for us and not a good sign already. All the above setup was done in QA environemnt as harbor and neuvector stay in the same cluster and i used the service hostname. the main disadvantage with this is that ca.crt rotation frequence needs to be closely monitoered else it will break. will cert manager also rotate ca.crt always?
+```bash
+export HARBOR_NS=harbor
+export HARBOR_URL=https://registry.x.com
+export HARBOR_ADMIN=admin
+read -rs HARBOR_PASS && export HARBOR_PASS
+export SCANNER_NAME=neuvector-qa
+export TEST_IMAGE=myproject/myapp:1.2.3     # the exact artifact that failed
+./dcs-neuvector/scripts/adapter-triage.sh > triage.txt 2>&1
+```
 
-Issues:
+Attach `triage.txt` whole. It collects ten sections; three of them will almost certainly contain the answer on their own:
 
-1. We currently use Trivy as our default image scanner in Harbor, but we are looking to switch to the NeuVector scanner using the Registry Adapter feature. However, after deploying the adapter and attempting to scan an image via Harbor, we encountered the error below. Could you advise if using the Registry Adapter for Harbor integration is a supported or recommended approach for this use case?
-    failed, error: the configured scanner neuvector-qa does not support scanning artifact with mime type application/vnd.oci.image.manifest.v1+json
+- **§6b** — `GET /api/v2.0/scanners/{uuid}/metadata`. This is the *same ping the scan path makes*. If it returns `consumes_mime_types` including the OCI manifest type, the metadata path is healthy and my diagnosis is wrong. If it errors, that error is the root cause.
+- **§8** — curl from inside the `harbor-core` pod to the registered endpoint, once with TLS verification and once without. Same pod, same network path, same trust store Harbor uses. This separates trust from reachability from auth in two lines.
+- **§10** — greps harbor-core for `api controller: get project scanner`, which is where the real error is logged before it gets flattened into the mime message.
 
-2. With the above dissapointment, i then tried to add the harbor registry onto Neuvector by using the registries config part manually and then i saw the same tls issue, but this time, neuvector is compaingin about signined by unknown authorty to harbor. since in sysintit cofg Enable_Tls_Verification this is always set to true, it always verifies, i manually disabled it and then it started to scan the harbor projects. in sysinitcfg there is also a Cacerts this setting, but adding the hugh chunk of root and inter ca certs is too much, is there no way we can add an additional volume to mount it into the neuvector pods and have them added to right path so they can by default trust all org pki signed urls? something liek we do in ahrbor like above, simply hook the secret/configmap with all the certs to the pod at specifid location and done, trust is already established? or Cacerts setting the only way? or do we need to only provide harbor public cert here and not the root and inter cert here?
+There is one command in §8c I deliberately left for you to run by hand, so the password never lands in a log file:
 
-3. I totally did not understand the registry adapter credentials part and why it is needed and do we need to create it in harbor first, if so then the robot account perm provided were not working, i gave following perms for the robot account and then create the adpter auth and then used the same robot creds when adding the scanner then it started tow ork.
-    perms:
-        system:
-            project: list
-            registry: read, list
-            catalog: read
-            security-hub: list, read
-            scan-all: create, read, stop, update
-        project:
-            repository: pull, list, read, update
-            artifact: list, read
-            artifact-addition: read
-            tag: list
-            accessory: list
-            scan: read, create, stop
-            sbom, read, create, stop
-            label: list, read
-            project: read, update
+```bash
+oc -n <harbor-ns> exec -it <core-pod> -- curl -sSk -u '<user>:<pass>' '<registered-endpoint>/api/v1/metadata'
+```
 
-4. neuvector scanner can not create sboms, where as trivy can do it. it is a limitation for us, we thought we can replace trivy compltly.
+## Questions the commands can't answer
+
+**Registration**
+1. Paste the Endpoint field **verbatim** as it appears in Harbor's scanner edit dialog — including or excluding `/endpoint`, port, trailing slash.
+2. Authorization type selected, and is "Skip certificate verification" ticked?
+3. Is "Use internal registry address" ticked?
+
+**Sequence — this matters more than it looks**
+4. In what order did you: add the CA to the bundle → restart Harbor → register the scanner → run the failing scan? Specifically, did the **adapter pod** restart at any point *after* the scanner was registered?
+5. How many `harbor-core` replicas do you run, and were **all** of them restarted after the CA configmap change — or just some?
+6. Did anything restart the NeuVector controller or scanner pods between the successful registration and the failed scan?
+
+**The scan itself**
+7. Was the failing scan triggered manually from the artifact page, from "Scan All", or by scan-on-push?
+8. At the moment the scan failed, what did Health show for `neuvector-qa` in Interrogation Services — Healthy or Unhealthy? (Refresh the page immediately after a failed scan; the 30s metadata cache means a stale reading otherwise.)
+9. Does it fail on **every** artifact, or only some? If you have a plain single-arch Docker-manifest image (`application/vnd.docker.distribution.manifest.v2+json` rather than OCI), does that one behave differently?
+10. Is the failure consistent, or does it succeed occasionally? (Intermittent points hard at multiple core replicas.)
+
+**Trivy comparison**
+11. Confirm Trivy scanned the *same digest*, not just the same tag.
+12. Is NeuVector set as the **default** scanner, or selected per-project? Which project did the failing scan run in?
+
+**Environment**
+13. Harbor version.
+14. Are you on the in-cluster Service URL or the Route for this test?
+15. Has `harbor-jobservice` also been restarted since the CA change? (The error you pasted comes from core, but jobservice runs the actual scan job, so it needs trust too — a failure there looks different but you'll hit it next.)
+
+## One thing worth doing before you run any of this
+
+If §6b comes back with a TLS error, the fix and the diagnosis are the same action: switch the adapter to the org-signed cert and the Route, since Harbor already trusts your PKI. `dcs.adapter.inClusterCert.enabled: false`, `core.cve.adapter.certificate.secret: dcs-neuvector-external-certs`, adapter Route enabled, Harbor pointed at `https://neuvector-adapter.apps.ocp-qa-hub.x.com/endpoint`.
+
+That removes the CA-injection step, the restart coupling and the ~8-month rotation landmine in one move. If the problem is trust, you'll never see it again; if it isn't, you've lost nothing and eliminated a variable before the next round of debugging.
