@@ -8,4 +8,26 @@ Issues:
 
 1. We currently use Trivy as our default image scanner in Harbor, but we are looking to switch to the NeuVector scanner using the Registry Adapter feature. However, after deploying the adapter and attempting to scan an image via Harbor, we encountered the error below. Could you advise if using the Registry Adapter for Harbor integration is a supported or recommended approach for this use case?
     failed, error: the configured scanner neuvector-qa does not support scanning artifact with mime type application/vnd.oci.image.manifest.v1+json
+
 2. With the above dissapointment, i then tried to add the harbor registry onto Neuvector by using the registries config part manually and then i saw the same tls issue, but this time, neuvector is compaingin about signined by unknown authorty to harbor. since in sysintit cofg Enable_Tls_Verification this is always set to true, it always verifies, i manually disabled it and then it started to scan the harbor projects. in sysinitcfg there is also a Cacerts this setting, but adding the hugh chunk of root and inter ca certs is too much, is there no way we can add an additional volume to mount it into the neuvector pods and have them added to right path so they can by default trust all org pki signed urls? something liek we do in ahrbor like above, simply hook the secret/configmap with all the certs to the pod at specifid location and done, trust is already established? or Cacerts setting the only way? or do we need to only provide harbor public cert here and not the root and inter cert here?
+
+3. I totally did not understand the registry adapter credentials part and why it is needed and do we need to create it in harbor first, if so then the robot account perm provided were not working, i gave following perms for the robot account and then create the adpter auth and then used the same robot creds when adding the scanner then it started tow ork.
+    perms:
+        system:
+            project: list
+            registry: read, list
+            catalog: read
+            security-hub: list, read
+            scan-all: create, read, stop, update
+        project:
+            repository: pull, list, read, update
+            artifact: list, read
+            artifact-addition: read
+            tag: list
+            accessory: list
+            scan: read, create, stop
+            sbom, read, create, stop
+            label: list, read
+            project: read, update
+
+4. neuvector scanner can not create sboms, where as trivy can do it. it is a limitation for us, we thought we can replace trivy compltly.
