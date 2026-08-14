@@ -1,0 +1,2 @@
+We currently use Trivy as our default image scanner in Harbor, but we are looking to switch to the NeuVector scanner using the Registry Adapter feature. However, after deploying the adapter and attempting to scan an image via Harbor, we encountered the error below. Could you advise if using the Registry Adapter for Harbor integration is a supported or recommended approach for this use case?
+failed, error: the configured scanner neuvector-qa does not support scanning artifact with mime type application/vnd.oci.image.manifest.v1+json
