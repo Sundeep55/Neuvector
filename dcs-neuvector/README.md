@@ -135,14 +135,23 @@ therefore come from the sealed `dcs-neuvector-external-certs` instead. Note this
 setting is about the *external* REST/UI certs only — internal component mTLS is a
 separate mechanism (`internal.*`, below).
 
-**Internal mTLS via cert-manager.** `internal.certmanager.enabled: true` creates
-a self-signed `Issuer` + CA `Certificate` named `dcs-neuvector-internal-certs` *inside the
-namespace* — it does not use (or need) the org ClusterIssuer, and it is not a
-browser-facing cert. Chosen over the built-in `cert-upgrader` rotation because
-the `Certificate` CR is declarative in git while the resulting Secret is not, so
-ArgoCD sees no drift. When this is on, every component's
-`internal.certificate.secret` must name that same secret or the upstream
-templates render an empty `secretName` — `validate.yaml` enforces it.
+**We own the internal CA, not the subchart.** `core.internal.certmanager.enabled`
+is **false**; `dcs.internalCa` creates the Issuer and CA Certificate instead.
+Upstream hardcodes a 2-year CA with no `renewBefore`, so cert-manager re-issues it
+about every 8 months — and every re-issue invalidates any trust bundle that pinned
+it (Harbor's, for one), turning a certificate renewal into a recurring manual task
+whose failure mode is a silently empty scan. Ours is 10 years with
+`rotationPolicy: Never`, so the key is reused on renewal and previously
+distributed copies of the CA keep validating.
+
+**Internal mTLS is still cert-manager**, just ours: a self-signed `Issuer` plus a
+CA `Certificate` inside the namespace. It does not use (or need) the org
+ClusterIssuer, and it faces no browser. cert-manager was chosen over the built-in
+`cert-upgrader` rotation because the `Certificate` CR is declarative in git while
+the resulting Secret is not, so ArgoCD sees no drift. Every component's
+`internal.certificate.secret` must name `dcs.internalCa.secretName` or the
+upstream templates render an empty `secretName` — `validate.yaml` enforces both
+that and the "two Certificates fighting over one secret" mistake.
 
 **External certs: one multi-SAN cert per cluster.** Route termination is
 `passthrough`, so the pod serves the cert directly and every SAN must equal its

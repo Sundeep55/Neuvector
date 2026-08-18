@@ -128,6 +128,7 @@ invalid. Whatever the final host is, it must appear verbatim as a SAN in
 | Harbor `Forbidden` | an HTTP proxy refused `CONNECT`. Go surfaces a failed proxy CONNECT as an error whose text is the proxy's status line. Check `oc -n <harbor-ns> set env deploy/harbor-core --list \| grep -i -e proxy`, and make sure `NO_PROXY` covers the name you are dialling |
 | Harbor `invalid character ... looking for beginning of value` | the adapter requires basic auth but Harbor was registered with Authorization = None. With no `Authorization` header the middleware neither serves the request nor writes an error, so Go emits an empty `200` and Harbor fails to parse it |
 | browser shows an untrusted cert | the pod started before the cert secret existed and generated a self-signed one — restart the deployment |
+| Harbor reports **Success with 0 vulnerabilities** in ~2s | the scan failed inside NeuVector; the adapter does not check `scanResult.Error` and returns an empty report — see "Success with zero vulnerabilities" |
 
 ## The mime-type error is a lie
 
@@ -207,6 +208,128 @@ things break the symmetry:
 Note also that `getScannerAdapterMetadataWithCache` caches the **error**, not
 just the success, in a 30-second in-memory cache. Wait out the 30s before
 concluding a fix did not work.
+
+## Success with zero vulnerabilities — the adapter swallows scan errors
+
+Harbor reporting `scan_status: Success`, `severity: None` and
+`vulnerabilityRecords=0` does **not** mean the image is clean. The adapter
+converts the controller's reply without ever looking at its error field:
+
+```go
+// registry-adapter/server/server.go
+func convertRPCReportToScanReport(scanResult *share.ScanResult) ScanReport {
+    var result ScanReport
+    result.Status = http.StatusOK          // <-- unconditional
+    result.GeneratedAt = time.Now().UTC()
+    result.Scanner = nvScanner
+    result.Vulnerabilities = convertVulns(scanResult.Vuls)   // empty on failure
+    ...
+}
+```
+
+`scanResult.Error` is never inspected. If the NeuVector scanner could not pull
+or unpack the image, `Vuls` is empty, and the adapter hands Harbor a
+well-formed, successful, empty report. Harbor stores it as a clean scan.
+
+The gRPC call itself succeeded, so the adapter logs nothing either — its only
+error paths are a failed gRPC connection or a failed image-name parse.
+
+**Tells that a "clean" result is really a failed scan:**
+
+- Scan duration of 1–3 seconds. A real pull, unpack and scan of an application
+  image takes appreciably longer.
+- Another scanner finds vulnerabilities in the same digest.
+- `vulnerabilityRecords="0"` in the Harbor jobservice log.
+
+**Where the real error is:** the NeuVector controller and scanner logs, at the
+timestamp of the scan.
+
+```bash
+oc -n dcs-neuvector logs deploy/neuvector-controller-pod --since=15m | grep -iE "scan|regist|x509|denied|unauthor"
+oc -n dcs-neuvector logs deploy/neuvector-scanner-pod    --since=15m | tail -100
+```
+
+**Most common cause:** the scanner cannot pull from the registry Harbor named in
+the request. The adapter passes Harbor's `Registry.URL` straight through, so the
+scanner must both reach that hostname and trust its certificate. Certificate
+trust for outbound registry connections is the system-wide
+`Cacerts` / `Enable_Tls_Verification` setting — see
+[initcfg/sysinitcfg.md](initcfg/sysinitcfg.md). It is shared with NeuVector's
+own registry scanning, so a cluster where "Assets -> Registries" only works with
+verification disabled will fail here too, silently.
+
+### Why this matters in production
+
+Harbor's "Prevent images with vulnerability severity X or higher from running"
+policy decides from the stored report (`src/server/middleware/vulnerable/vulnerable.go`):
+
+| artifact state | pull |
+|---|---|
+| no report, artifact scannable | **blocked** |
+| no report, artifact not scannable | allowed (skipped) |
+| report present, `scan_status != Success` | **blocked** |
+| report `Success`, severity >= threshold | **blocked** |
+| report `Success`, severity below threshold — including `None` | **allowed** |
+
+An empty-but-successful report therefore lands in the one row that lets the image
+through. A scan that *errors* is safe (blocked); a scan that silently returns
+nothing is not. That inverts the usual fail-safe assumption, so it deserves a
+detection control rather than trust.
+
+**The failure is confined to one path.** A broken Harbor→adapter trust is
+*loud*: the metadata ping fails and Harbor reports the mime-type error. Only a
+broken **scanner→registry** pull is silent, and that depends on
+`Cacerts` / `Enable_Tls_Verification` — the org PKI chain, which rotates on a
+scheduled multi-year cadence, not on cert-manager's clock. Put the long-lived
+**root** in `Cacerts`, not only the issuing intermediate, and the exposure
+shrinks to a planned event.
+
+**Detection control.** Harbor cannot distinguish an empty report from a clean
+image, so the only reliable check is a canary: keep a deliberately vulnerable
+image in a dedicated project, scan it on a schedule, and alert if the result is
+ever `severity: None` or zero vulnerabilities.
+
+```bash
+curl -sS -u "$ADMIN:$PASS" -X POST \
+  "$HARBOR/api/v2.0/projects/$CANARY_PROJECT/repositories/$REPO/artifacts/$TAG/scan"
+sleep 30
+curl -sS -u "$ADMIN:$PASS" \
+  "$HARBOR/api/v2.0/projects/$CANARY_PROJECT/repositories/$REPO/artifacts/$TAG?with_scan_overview=true" \
+  | python3 -c 'import sys,json
+so=json.load(sys.stdin).get("scan_overview") or {}
+for mt,r in so.items():
+    n=r.get("summary",{}).get("total",0)
+    print("FAIL: scanner returned 0 vulnerabilities" if not n else f"ok: {n} findings")'
+```
+
+A scan finishing in 1–3 seconds is the other cheap signal — real scans of an
+application image take appreciably longer.
+
+## No registry entry is needed in NeuVector
+
+A frequent assumption is that the image must first be scanned through
+**Assets -> Registries** in the NeuVector UI, with the adapter merely relaying a
+stored score. That is not how it works:
+
+```go
+request := share.AdapterScanImageRequest{
+    Registry:   reg,                              // from Harbor's scan request
+    Repository: repo,
+    Tag:        tag,
+    Token:      scanRequest.Registry.Authorization, // Harbor's per-scan token
+    ScanLayers: true,
+}
+result, err := client.ScanImage(ctx, &request)
+```
+
+Every scan is self-contained: Harbor supplies the registry URL and a short-lived
+token, the adapter forwards them to the controller over gRPC, and a scanner pulls
+and scans that image on the spot. Nothing is read from a configured registry, and
+no prior UI scan is required.
+
+What *is* shared with the registry-scanning path is the system TLS configuration
+above — which is why the two failures look related even though the flows are
+independent.
 
 ## Prove the adapter before touching Harbor
 

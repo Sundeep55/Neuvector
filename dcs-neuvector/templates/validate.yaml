@@ -104,8 +104,11 @@ failure mode we can actually hit with this topology.
 
 {{/* 7. cert-manager internal CA: the upstream template renders an empty
       secretName unless every component points at the Issuer's secret. */}}
-{{- if .Values.core.internal.certmanager.enabled -}}
-  {{- $want := .Values.core.internal.certmanager.secretname -}}
+{{- if or .Values.core.internal.certmanager.enabled .Values.dcs.internalCa.enabled -}}
+  {{- $want := .Values.dcs.internalCa.enabled | ternary .Values.dcs.internalCa.secretName .Values.core.internal.certmanager.secretname -}}
+  {{- if and .Values.core.internal.certmanager.enabled .Values.dcs.internalCa.enabled -}}
+  {{- fail "core.internal.certmanager.enabled and dcs.internalCa.enabled are both true — two cert-manager Certificates would fight over the same secret. Turn the upstream one off." -}}
+  {{- end -}}
   {{- range $c := list "controller" "enforcer" }}
     {{- $got := (index $.Values.core $c).internal.certificate.secret -}}
     {{- if ne $got $want -}}

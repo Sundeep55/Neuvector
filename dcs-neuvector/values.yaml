@@ -211,6 +211,44 @@ dcs:
   #      password: AgB...
 
   # ----------------------------------------------------------------------------
+  # Internal component-mTLS CA, owned here rather than by the subchart.
+  #
+  # The upstream `internal.certmanager` CA is hardcoded to a 2-year lifetime with
+  # no renewBefore, so cert-manager re-issues it roughly every 8 months. Every
+  # re-issue changes ca.crt and breaks anything that pinned it — notably Harbor's
+  # trusted-CA bundle, which then needs a ConfigMap update and a core restart.
+  # That is a recurring manual task whose failure mode is a silently empty scan.
+  #
+  # Owning the Certificate lets us choose the lifetime and pin the private key.
+  # With rotationPolicy: Never a re-issued CA keeps the same subject and public
+  # key, so a previously distributed copy still validates the chain — the trust
+  # bundle only has to be refreshed before notAfter, not on every renewal.
+  #
+  # Keep core.internal.certmanager.enabled=false while this is on.
+  # ----------------------------------------------------------------------------
+  internalCa:
+    enabled: true
+    secretName: dcs-neuvector-internal-certs
+    selfSignedIssuerName: dcs-neuvector-internal-selfsigned
+    commonName: neuvector.internal
+    organization: NeuVector
+    # 10 years. This CA signs only component-to-component mTLS inside one
+    # namespace plus the adapter's server cert; its key never leaves that
+    # namespace. The alternative is re-syncing a trust bundle across two clusters
+    # every 8 months, which is the larger operational risk. Shorten it if your
+    # policy requires — 43800h is 5 years.
+    duration: 87600h
+    renewBefore: 8760h        # 1 year
+    privateKey:
+      algorithm: RSA
+      size: 4096
+      # Never = reuse the key on renewal, so already-distributed copies of the
+      # CA certificate keep validating. Always = new key every renewal, which
+      # forces a trust-bundle update on the spot. Do not change this to Always
+      # unless you have automation for the bundle.
+      rotationPolicy: Never
+
+  # ----------------------------------------------------------------------------
   # Harbor pluggable-scanner adapter (hub only). Enabling this lets Harbor
   # delegate image scanning to NeuVector instead of Trivy, which removes Trivy's
   # need to pull a CVE database over the internet — NeuVector's database arrives
@@ -293,8 +331,12 @@ core:
     # namespace — it does not use (and does not need) the org ClusterIssuer.
     # Chosen over the built-in rotation because the Certificate CR is
     # declarative in git while the resulting Secret is not, so Argo sees no drift.
+    # OFF: dcs.internalCa owns this CA so we control its lifetime. The
+    # secretname is still read by nothing upstream when disabled, but the four
+    # per-component internal.certificate.secret settings below are what actually
+    # mount it, and they must name dcs.internalCa.secretName.
     certmanager:
-      enabled: true
+      enabled: false
       secretname: dcs-neuvector-internal-certs
     autoGenerateCert: false
     autoRotateCert: false
