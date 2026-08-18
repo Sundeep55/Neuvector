@@ -1,396 +1,64 @@
-### writing to adapter-triage-20260818-142220.log — scp this one file when done ###
+Let me verify the prod-risk behaviour and the SBOM question rather than reason from memory.
 
-==================================================================
-== 0. CONTEXT
-==================================================================
-2026-08-18T14:22:20Z   (all timestamps UTC)
-MODE                 : CROSS-CLUSTER
-HARBOR_CONTEXT       : dcs-registry/api-opsh-domain-corp:6443/DIA2203152236PN0011
-NV_CONTEXT           : dcs-registry/api-dev-domain-corp:6443/sundeep.sirigiri@airbus.com
-HARBOR_NS / URL      : dcs-registry / https://registry.domain.corp
-NV_NS                : dcs-neuvector
-adapter deploy / svc : neuvector-registry-adapter-pod / neuvector-service-registry-adapter
-SCANNER_NAME         : neuvector-dev
-TEST_IMAGE           : aaa/vcluster:0.23
-PING_COUNT           : 5
-SET_PROJECT_SCANNER  : 0      DO_SCAN: 1
+Now the chart change so you own the internal CA lifecycle instead of upstream's 2-year default:
 
---- contexts actually reachable ---
-  harbor cluster : namespace/dcs-registry
-  nv cluster     : namespace/dcs-neuvector
-    # Cross-cluster: the adapter MUST be reached over its Route. In-cluster
-    # Service DNS (*.svc.cluster.local) cannot resolve from the Harbor cluster.
+Good — that confirms the whole chain end to end.
 
-==================================================================
-== [Q13] HARBOR VERSION
-==================================================================
-{
-  "harbor_version": "v2.14.0-44a74424",
-  "auth_mode": "db_auth",
-  "registry_url": "registry.domain.corp",
-  "external_url": "https://registry.domain.corp"
-}
+## 1. The CA rotation problem — and the latency worry is unfounded
 
-==================================================================
-== [Q1][Q2][Q3][Q12][Q14] SCANNER REGISTRATION — as Harbor stores it
-==================================================================
-{
-  "access_credential": "",
-  "auth": "",
-  "capabilities": {
-    "support_sbom": true,
-    "support_vulnerability": true
-  },
-  "create_time": "2025-05-05T16:53:44.339Z",
-  "description": "The Trivy scanner adapter",
-  "disabled": false,
-  "is_default": true,
-  "name": "Trivy",
-  "skip_certVerify": false,
-  "update_time": "2025-05-05T16:53:44.339Z",
-  "url": "https://image-registry-harbor-trivy:8443",
-  "use_internal_addr": true,
-  "uuid": "8157ae95-29d1-11f0-bdc6-0a580a8004a0"
-}
-------------------------------------------------------------
-{
-  "access_credential": "dcs-nv-scanner:PASSSSSSS!",
-  "auth": "Basic",
-  "capabilities": {
-    "support_vulnerability": true
-  },
-  "create_time": "2026-08-12T08:48:49.208Z",
-  "description": "",
-  "disabled": false,
-  "is_default": false,
-  "name": "neuvector-dev",
-  "skip_certVerify": false,
-  "update_time": "2026-08-12T08:48:49.208Z",
-  "url": "https://container-security-adapter.apps.dev.domain.corp/endpoint",
-  "use_internal_addr": false,
-  "uuid": "a2f6ff36-962a-11f1-8652-0a580a80041b"
-}
-------------------------------------------------------------
-    # Q1  url verbatim — must end in /endpoint; :9443 for a Service, no port for a Route
-    # Q2  auth ('' means None) and skip_certVerify
-    # Q3  use_internal_addr
-    # Q12 is_default
-    # Q14 Service DNS vs Route host
+**The latency concern doesn't apply.** The adapter connection is **control plane only**: Harbor POSTs a small JSON scan request and polls a small JSON report. The image layers are pulled by the NeuVector *scanner*, directly from Harbor's registry, over a completely separate connection that never touches the adapter. So a Route hairpin costs a few milliseconds on two or three tiny requests per scan. It has no bearing on scan throughput.
 
-resolved uuid      : a2f6ff36-962a-11f1-8652-0a580a80041b
-resolved endpoint  : https://container-security-adapter.apps.dev.domain.corp/endpoint
-registered/updated : 2026-08-12T08:48:49.208Z
+So the Route is genuinely fine, and it's the option with the least ongoing work: Harbor already trusts your org PKI, so there's no bundle to maintain and no rotation coupling at all.
 
-==================================================================
-== [Q8] THE DECISIVE CALL — Harbor's own metadata ping
-==================================================================
-    # Same Ping the scan path runs. Capabilities here => r.Metadata is populated
-    # and the mime-type error cannot originate from this call.
-scanner: {"name": "NeuVector", "vendor": "NeuVector", "version": "4.245"}
-capability type: vulnerability
-  consumes: ['application/vnd.oci.image.manifest.v1+json', 'application/vnd.docker.distribution.manifest.v2+json']
-  produces: ['application/vnd.security.vulnerability.report; version=1.1']
+**But you can also keep the in-cluster path**, and I've made that safe. The problem was that upstream hardcodes the CA at `duration: 17520h` with no `renewBefore`, so cert-manager re-issues every ~8 months — your log shows exactly that (`RENEWAL: 2027-12-11`, `NOTAFTER: 2028-08-10`). You can't change it, because it's the subchart's Certificate.
 
-OCI manifest advertised : True
-SBOM capability present : False  # false => Trivy must stay
+So the chart now owns it. `core.internal.certmanager.enabled: false`, and a new `dcs.internalCa` block creates the Issuer and CA itself:
 
---- health as Harbor records it ---
-{
-  "name": "neuvector-dev",
-  "health": null,
-  "disabled": false,
-  "adapter": null,
-  "vendor": null,
-  "version": null
-}
+```yaml
+dcs:
+  internalCa:
+    duration: 87600h        # 10 years
+    renewBefore: 8760h      # 1 year
+    privateKey:
+      rotationPolicy: Never
+```
 
-==================================================================
-== [Q10] CONSISTENT OR INTERMITTENT?
-==================================================================
-  attempt 1  HTTP 200
-  attempt 2  HTTP 200
-  attempt 3  HTTP 200
-  attempt 4  HTTP 200
-  attempt 5  HTTP 200
-    # Harbor caches BOTH success and failure for 30s per core pod, so identical
-    # answers inside 30s prove nothing on their own — the per-pod probe below does.
+Two things make this a one-time activity. The 10-year lifetime pushes renewal out to year nine. And `rotationPolicy: Never` reuses the private key, so even when the certificate is eventually re-issued it carries the **same subject and same public key** — the copy already sitting in Harbor's bundle still validates the chain. You'd only need to refresh the bundle before the old certificate's `notAfter`, not on every renewal.
 
---- [Q5] harbor-core pods (Harbor cluster) ---
-NAME                                          READY   RESTARTS   STARTED                NODE
-image-registry-harbor-core-7845675fbf-bsqnv   true    0          2026-08-18T14:11:43Z   otn-ac-xxxx.opsh.domain.corp
-core replica count: 1
+Verified: components still mount the internal cert correctly, the upstream Certificate no longer renders, and a guard fails the render if both CAs are ever enabled at once.
 
---- [Q15] harbor-jobservice pods (Harbor cluster) ---
-NAME                                                READY   RESTARTS   STARTED
-image-registry-harbor-jobservice-5bdf95c964-rwspx   true    0          2026-08-18T14:21:25Z
-    # jobservice runs the scan job itself; it needs the same trust as core.
+My recommendation is still the Route, because "no shared state between two clusters" beats "shared state that expires in a decade". But if you prefer in-cluster, this makes it defensible.
 
-==================================================================
-== [Q5][Q10] PER-POD PROBE — isolates one stale replica
-==================================================================
+## 2. The silent-failure risk in prod — you're right, and it's precise
 
---- from core pod image-registry-harbor-core-7845675fbf-bsqnv ---
-  Defaulted container "core" out of: core, seed-tuf-cache (init)
-  verify-TLS : 200
-  skip-TLS   : 200
-    # 401 skip-TLS          -> reachable + TLS fine, credentials wrong
-    # 200 skip / fail verify-> trust problem only
-    # both fail on ONE pod  -> that replica is stale; restart it
-    # all fail identically  -> network path, auth, or the adapter is not listening
+I checked Harbor's blocking logic (`src/server/middleware/vulnerable/vulnerable.go`):
 
---- [Q-proxy] proxy env on harbor-core ---
-  no proxy env (or set HARBOR_CORE_DEPLOY)
-    # HTTPS_PROXY set + adapter host missing from NO_PROXY => Go error 'Forbidden'
+| artifact state | pull |
+|---|---|
+| no report, scannable | **blocked** |
+| no report, not scannable | allowed (skipped) |
+| report present, `scan_status != Success` | **blocked** |
+| report `Success`, severity ≥ threshold | **blocked** |
+| report `Success`, severity below threshold — **including `None`** | **allowed** |
 
---- [Q-trust] custom CA material inside core ---
-  Defaulted container "core" out of: core, seed-tuf-cache (init)
-  total 232
-  drwxr-xr-x 2 root root       27 2026-08-18 14:11 .
-  dr-xr-xr-x 1 root root       78 2026-08-18 14:11 ..
-  -rw-r--r-- 1 root harbor 235751 2026-08-18 14:11 custom-ca.crt
-  /etc/pki/tls/certs/ca-bundle.crt: 294 certs
-  command terminated with exit code 1
+An empty-but-successful report lands in the one row that lets the image through. A scan that *errors* is safe; a scan that silently returns nothing is not. Your instinct was correct.
 
-==================================================================
-== [Q14] THE ENDPOINT SEEN FROM OUTSIDE (matters most in CROSS-CLUSTER)
-==================================================================
-endpoint host:port = container-security-adapter.apps.dev.domain.corp:443
-  -> external hostname (Route/LB)
+Two things bound the risk, though:
 
---- certificate served at container-security-adapter.apps.dev.domain.corp:443, from this workstation ---
-  subject=C=DE, O=Company, OU=Devices, OU=AD and S GmbH TB CF, CN=container-security.apps.dev.domain.corp
-  issuer=C=DE, O=Company, CN=Issuing CA G1
-  notBefore=Aug 11 07:23:30 2026 GMT
-  notAfter=Aug 10 07:23:30 2029 GMT
-  X509v3 Subject Alternative Name: 
-      DNS:container-security.apps.dev.domain.corp, DNS:container-security-api.apps.dev.domain.corp, DNS:container-security-fed.apps.dev.domain.corp, DNS:container-security-adapter.apps.dev.domain.corp
+**The failure is confined to one path.** A broken Harbor→adapter trust is *loud* — the metadata ping fails and you get the mime-type error, no report is stored, and Harbor blocks the pull. Only a broken **scanner→registry** pull is silent. That one depends on `Cacerts`/`Enable_Tls_Verification` — your **org PKI**, which rotates on a scheduled multi-year cadence, not on cert-manager's clock. So the cert-manager CA you're worried about cannot cause the silent mode. Put the long-lived **root** in `Cacerts`, not just the issuing intermediate, and the exposure narrows to a planned event.
 
---- metadata endpoint from this workstation ---
-  verify-TLS : 200
-  skip-TLS   : 200
-    # Compare with the per-pod probe: same result => shared cause;
-    # works here but not from core => core-specific trust or proxy.
+**For detection, a canary is the only reliable control**, because Harbor genuinely cannot tell an empty report from a clean image. Keep a deliberately vulnerable image in a dedicated project, scan it on a schedule, alert if it ever comes back with zero findings. Your "policy requiring ≥1 vuln" instinct is the right idea, just applied to one known-bad canary rather than to every image. A scan finishing in 1–3 seconds is the other cheap signal.
 
-==================================================================
-== [Q4][Q6] TIMELINE — did anything restart after registration?
-==================================================================
-scanner registered/updated : 2026-08-12T08:48:49.208Z
+The blocking matrix and a canary script are now in [docs/harbor-adapter.md](dcs-neuvector/docs/harbor-adapter.md).
 
---- NeuVector pods (NV cluster) ---
-NAME                                              READY   RESTARTS   STARTED
-neuvector-controller-pod-574654cff5-z7wf5         true    2          2026-08-11T12:58:20Z
-neuvector-enforcer-pod-2t95v                      true    0          2026-08-18T13:42:28Z
-neuvector-enforcer-pod-59tqr                      true    0          2026-08-11T12:58:16Z
-neuvector-enforcer-pod-5p9qv                      true    0          2026-08-11T12:58:16Z
-neuvector-enforcer-pod-6kcmq                      true    0          2026-08-11T12:58:16Z
-neuvector-enforcer-pod-8dc4s                      true    3          2026-08-11T12:58:15Z
-neuvector-enforcer-pod-8m6rk                      true    0          2026-08-11T12:58:16Z
-neuvector-enforcer-pod-bgs7g                      true    0          2026-08-11T12:58:16Z
-neuvector-enforcer-pod-cfx8g                      true    0          2026-08-11T12:58:16Z
-neuvector-enforcer-pod-ddtw2                      true    0          2026-08-11T13:51:50Z
-neuvector-enforcer-pod-ffz8w                      true    0          2026-08-11T12:58:16Z
-neuvector-enforcer-pod-k8xnm                      true    0          2026-08-11T12:58:16Z
-neuvector-enforcer-pod-m5jvb                      true    0          2026-08-11T12:58:16Z
-neuvector-enforcer-pod-nxxlc                      true    1          2026-08-11T12:58:16Z
-neuvector-enforcer-pod-qz7sh                      true    0          2026-08-11T12:58:16Z
-neuvector-enforcer-pod-tg9bc                      true    0          2026-08-11T12:58:16Z
-neuvector-manager-pod-6bdb89667d-jfsfq            true    0          2026-08-11T12:58:16Z
-neuvector-registry-adapter-pod-656b95bbbf-hjd54   true    0          2026-08-11T14:05:50Z
-neuvector-scanner-pod-66b4f497b7-vdww4            true    0          2026-08-18T14:02:39Z
-neuvector-updater-pod-29780820-28q82              false   0          2026-08-16T03:00:01Z
-neuvector-updater-pod-29782260-kctz9              false   0          2026-08-17T03:00:01Z
-neuvector-updater-pod-29783700-4fkxr              false   0          2026-08-18T03:00:00Z
-    # Q4 adapter STARTED after registration => it restarted since; re-check it is listening
-    # Q6 controller/scanner STARTED after registration matters: the adapter blocks
-    #    before it listens until it can read the scanner version from the controller
+## 3. SBOM — no support, and no partial workaround inside a project
 
-==================================================================
-== [Q-adapter] ADAPTER — wiring, cert, listening state (NV cluster)
-==================================================================
-        - name: CLUSTER_JOIN_ADDR
-        - name: HARBOR_SERVER_PROTO
-        - name: HARBOR_BASIC_AUTH_USERNAME
-        - name: HARBOR_BASIC_AUTH_PASSWORD
-        image: registry.domain.corp/dcs-internal-images/neuvector/registry-adapter:0.2.9
-        - mountPath: /etc/neuvector/certs/internal/cert.key
-          subPath: tls.key
-        - mountPath: /etc/neuvector/certs/internal/cert.pem
-          subPath: tls.crt
-        - mountPath: /etc/neuvector/certs/internal/ca.cert
-          subPath: ca.crt
-        - mountPath: /etc/neuvector/certs/ssl-cert.key
-          subPath: tls.key
-        - mountPath: /etc/neuvector/certs/ssl-cert.pem
-          subPath: tls.crt
-          secretName: dcs-neuvector-external-certs
-          secretName: dcs-neuvector-internal-certs
+I searched both repositories: **zero** files matching `sbom` in `neuvector/neuvector` or `neuvector/registry-adapter`. The adapter advertises one capability, `type: vulnerability`, and your own Harbor confirms it — `Trivy: {support_sbom: true, support_vulnerability: true}` versus `neuvector-dev: {support_vulnerability: true}`.
 
---- service ---
-      {"apiVersion":"v1","kind":"Service","metadata":{"annotations":{"argocd.argoproj.io/installation-id":"dcs.airbusds.corp","argocd.argoproj.io/tracking-id":"neuvector:/Service:dcs-neuvector/neuvector-service-registry-adapter"},"labels":{"chart":"core-2.11.0","release":"neuvector"},"name":"neuvector-service-registry-adapter","namespace":"dcs-neuvector"},"spec":{"ports":[{"appProtocol":"HTTPS","name":"registry-adapter","port":9443,"protocol":"TCP"}],"selector":{"app":"neuvector-registry-adapter-pod"},"type":"ClusterIP"},"status":{"loadBalancer":{}}}
-  name: neuvector-service-registry-adapter
-  - appProtocol: HTTPS
-    port: 9443
-    targetPort: 9443
-  type: ClusterIP
+Harbor generates SBOMs using the **project's** scanner, and a project has exactly one. So you cannot run NeuVector for vulnerabilities and Trivy for SBOM in the same project. The realistic options:
 
---- routes in dcs-neuvector ---
-NAME                               HOST                                                                                            TARGETPORT         TLS
-neuvector-route-api                container-security-api.apps.dev.domain.corp       controller-api     passthrough
-neuvector-route-registry-adapter   container-security-adapter.apps.dev.domain.corp   registry-adapter   passthrough
-neuvector-route-webui              container-security.apps.dev.domain.corp           manager            passthrough
+- **Per-project split** — Trivy stays the default; NeuVector on projects where SBOM isn't required. Ugly for a NaaS with uniform tenants.
+- **Generate SBOMs outside Harbor** — syft or similar in CI, pushed as an OCI accessory. Decouples it from the scanner choice entirely, and is where most people land when their scanner lacks SBOM.
+- **Keep Trivy as default and treat NeuVector as the runtime-security tool**, using its registry scanning for admin-facing vulnerability posture rather than as Harbor's scanner.
 
---- adapter log — FIRST 40 lines (the ones that matter) ---
-2026-08-11T14:05:51.906|INFO|SAP|main.main: START - version=v0.2.9
-2026-08-11T14:06:27.577|WARN|SAP|server.unhandled: Unhandled HTTP Endpoint - endpoint=/
-2026-08-11T14:09:10.31 |WARN|SAP|server.unhandled: Unhandled HTTP Endpoint - endpoint=/
-2026-08-11T14:10:37.845|WARN|SAP|server.unhandled: Unhandled HTTP Endpoint - endpoint=/api/v1/metadata
-2026-08-11T14:16:40.108|WARN|SAP|server.unhandled: Unhandled HTTP Endpoint - endpoint=/api/v1/metadata
-2026-08-11T14:19:08.956|WARN|SAP|server.unhandled: Unhandled HTTP Endpoint - endpoint=/endpoint
-2026-08-12T07:38:40.151|WARN|SAP|server.unhandled: Unhandled HTTP Endpoint - endpoint=/api/v1/metadata
-2026-08-12T07:38:40.385|WARN|SAP|server.unhandled: Unhandled HTTP Endpoint - endpoint=/favicon.ico
-2026-08-12T07:44:10.4  |WARN|SAP|server.unhandled: Unhandled HTTP Endpoint - endpoint=/
-2026-08-12T07:44:49.834|WARN|SAP|server.unhandled: Unhandled HTTP Endpoint - endpoint=/api/v1/metadata
-2026-08-12T07:45:08.856|WARN|SAP|server.unhandled: Unhandled HTTP Endpoint - endpoint=/endpoint
-2026-08-12T07:45:49.467|WARN|SAP|server.unhandled: Unhandled HTTP Endpoint - endpoint=/api/v1/metadata
-2026-08-12T07:45:55.66 |WARN|SAP|server.unhandled: Unhandled HTTP Endpoint - endpoint=/api/v2/metadata
-2026-08-18T13:57:06.421|WARN|SAP|server.unhandled: Unhandled HTTP Endpoint - endpoint=/api/v1/metadata
-2026-08-18T13:57:06.421|WARN|SAP|server.unhandled: Unhandled HTTP Endpoint - endpoint=/api/v2/metadata
-2026-08-18T13:57:06.692|WARN|SAP|server.unhandled: Unhandled HTTP Endpoint - endpoint=/favicon.ico
-2026-08-18T13:57:06.791|WARN|SAP|server.unhandled: Unhandled HTTP Endpoint - endpoint=/favicon.ico
-    # 'START - version=...' then silence => still blocked in for nvScanner.Version==""
-    # and NOT listening on 9443 at all.
-
---- adapter log — LAST 40 lines ---
-2026-08-11T14:05:51.906|INFO|SAP|main.main: START - version=v0.2.9
-2026-08-11T14:06:27.577|WARN|SAP|server.unhandled: Unhandled HTTP Endpoint - endpoint=/
-2026-08-11T14:09:10.31 |WARN|SAP|server.unhandled: Unhandled HTTP Endpoint - endpoint=/
-2026-08-11T14:10:37.845|WARN|SAP|server.unhandled: Unhandled HTTP Endpoint - endpoint=/api/v1/metadata
-2026-08-11T14:16:40.108|WARN|SAP|server.unhandled: Unhandled HTTP Endpoint - endpoint=/api/v1/metadata
-2026-08-11T14:19:08.956|WARN|SAP|server.unhandled: Unhandled HTTP Endpoint - endpoint=/endpoint
-2026-08-12T07:38:40.151|WARN|SAP|server.unhandled: Unhandled HTTP Endpoint - endpoint=/api/v1/metadata
-2026-08-12T07:38:40.385|WARN|SAP|server.unhandled: Unhandled HTTP Endpoint - endpoint=/favicon.ico
-2026-08-12T07:44:10.4  |WARN|SAP|server.unhandled: Unhandled HTTP Endpoint - endpoint=/
-2026-08-12T07:44:49.834|WARN|SAP|server.unhandled: Unhandled HTTP Endpoint - endpoint=/api/v1/metadata
-2026-08-12T07:45:08.856|WARN|SAP|server.unhandled: Unhandled HTTP Endpoint - endpoint=/endpoint
-2026-08-12T07:45:49.467|WARN|SAP|server.unhandled: Unhandled HTTP Endpoint - endpoint=/api/v1/metadata
-2026-08-12T07:45:55.66 |WARN|SAP|server.unhandled: Unhandled HTTP Endpoint - endpoint=/api/v2/metadata
-2026-08-18T13:57:06.421|WARN|SAP|server.unhandled: Unhandled HTTP Endpoint - endpoint=/api/v1/metadata
-2026-08-18T13:57:06.421|WARN|SAP|server.unhandled: Unhandled HTTP Endpoint - endpoint=/api/v2/metadata
-2026-08-18T13:57:06.692|WARN|SAP|server.unhandled: Unhandled HTTP Endpoint - endpoint=/favicon.ico
-2026-08-18T13:57:06.791|WARN|SAP|server.unhandled: Unhandled HTTP Endpoint - endpoint=/favicon.ico
-
---- certificate the adapter serves ---
-  cert secret: dcs-neuvector-external-certs
-  subject=C=DE, O=Company, OU=Devices, OU=AD and S GmbH TB CF, CN=container-security.apps.dev.domain.corp
-  issuer=C=DE, O=Company, CN=Issuing CA G1
-  notBefore=Aug 11 07:23:30 2026 GMT
-  notAfter=Aug 10 07:23:30 2029 GMT
-  X509v3 Subject Alternative Name: 
-      DNS:container-security.apps.dev.domain.corp, DNS:container-security-api.apps.dev.domain.corp, DNS:container-security-fed.apps.dev.domain.corp, DNS:container-security-adapter.apps.dev.domain.corp
-    # For a Route the SAN must equal the Route host exactly.
-
---- internal CA + cert-manager renewal timing ---
-  subject=O=NeuVector, CN=neuvector.internal
-  notBefore=Aug 11 08:59:10 2026 GMT
-  notAfter=Aug 10 08:59:10 2028 GMT
-  sha256 Fingerprint=xx:AB:42:xx:98:5D:74:xx:79:87:9B:13:7C:8F:xx:E8:FB:xx:6C:C2:C1:xx:F8:C8:41:BB:8F:E6:58:xx:E0:FF
-NAME                           READY   NOTAFTER               RENEWAL
-dcs-neuvector-internal-certs   True    2028-08-10T08:59:10Z   2027-12-11T00:59:10Z
-
---- adapter credential fingerprints (values never printed) ---
-  username sha256[0:12]=f82e59f26ed3  len=14
-  password sha256[0:12]=5256472ab0b3  len=14
-    # Harbor does not expose its stored copy via API — compare in the edit dialog,
-    # or simply re-enter both sides to guarantee they match.
-
-==================================================================
-== [Q6] NEUVECTOR CONTROLLER / SCANNER
-==================================================================
-NAME                       READY   DESIRED
-neuvector-controller-pod   1       1
-neuvector-scanner-pod      1       1
-
---- controller log — config / TLS lines ---
-
-==================================================================
-== [Q9][Q11][Q12] TEST ARTIFACT AND ITS SCAN HISTORY
-==================================================================
-project=aaa repo=vcluster ref=0.23
-
---- [Q12] scanner currently configured FOR THIS PROJECT ---
-{
-  "uuid": "a2f6ff36-962a-11f1-8652-0a580a80041b",
-  "name": "neuvector-dev",
-  "url": "https://container-security-adapter.apps.dev.domain.corp/endpoint",
-  "is_default": false,
-  "health": "healthy"
-}
-    # A scan uses THIS scanner. If it is Trivy, the scan never touches NeuVector.
-
---- artifact type / media type / scan overview ---
-{
-  "type": "IMAGE",
-  "media_type": "application/vnd.docker.container.image.v1+json",
-  "manifest_media_type": "application/vnd.docker.distribution.manifest.v2+json",
-  "digest": "sha256:1776d13c958f5151dfd3ceed733ea68d5164b05bf2d300c9affcc4ed34262a03",
-  "is_image_index": false,
-  "accessories": []
-}
-
-scan_overview (one entry per report mime type):
-  application/vnd.security.vulnerability.report; version=1.1 -> {"scan_status": "Success", "severity": "None", "report_id": "fa9ad7ca-6325-48a6-9aa4-b13d76bd36df", "start_time": "2026-08-18T14:21:05.000Z", "end_time": "2026-08-18T14:21:07.000Z", "scanner": {"name": "NeuVector", "vendor": "NeuVector", "version": "4.245"}}
-    # Q9  type must be IMAGE. Anything else and no scanner can scan it.
-    # Q11 compare digest with what Trivy scanned; the scanner field inside
-    #     scan_overview names which scanner produced each report.
-
---- [Q9] media-type mix in this repository (up to 20 artifacts) ---
-  IMAGE application/vnd.docker.distribution.manifest.v2+json 0.23
-  IMAGE application/vnd.oci.image.manifest.v1+json dns-plugin-fixed
-
---- [Q7] DO_SCAN=1 — triggering a scan (MUTATION) ---
-POST scan -> HTTP 202
-waiting 25s for the job...
-  application/vnd.security.vulnerability.report; version=1.1 -> {"scan_status": "Success", "severity": "None", "scanner": {"name": "NeuVector", "vendor": "NeuVector", "version": "4.245"}}
-
-==================================================================
-== [Q7] SCAN-ALL SCHEDULE (are scans also auto-triggered?)
-==================================================================
-    (could not parse response)
-
-==================================================================
-== THE REAL ERROR — core logs, where it hides under a different prefix
-==================================================================
-
---- core pod image-registry-harbor-core-7845675fbf-bsqnv ---
-2026-08-18T14:19:18Z [ERROR] [/controller/event/handler/internal/artifact.go:264]: scan artifact dcs-internal-images/sigstore/rekor/rekor-server@sha256:28a049216455cd3702a2bfe8d1e83dce7443dd5b10cdc8d2fb77fb9c057eba38 failed, error: the configured scanner Trivy does not support scanning artifact with mime type application/vnd.oci.image.manifest.v1+json
-    # 'api controller: get project scanner' carries the ACTUAL failure.
-    # 'does not support scanning artifact' is only its downstream symptom.
-
---- jobservice logs ---
-2026-08-18T14:21:40Z [INFO] [/pkg/reg/adapter/native/adapter.go:36]: the factory for adapter docker-registry registered
-2026-08-18T14:21:40Z [INFO] [/pkg/reg/adapter/aliacr/adapter.go:54]: the factory for adapter ali-acr registered
-2026-08-18T14:21:40Z [INFO] [/pkg/reg/adapter/awsecr/adapter.go:44]: the factory for adapter aws-ecr registered
-2026-08-18T14:21:40Z [INFO] [/pkg/reg/adapter/azurecr/adapter.go:29]: Factory for adapter azure-acr registered
-2026-08-18T14:21:40Z [INFO] [/pkg/reg/adapter/dockerhub/adapter.go:40]: Factory for adapter docker-hub registered
-2026-08-18T14:21:40Z [INFO] [/pkg/reg/adapter/dtr/adapter.go:36]: the factory of dtr adapter was registered
-2026-08-18T14:21:40Z [INFO] [/pkg/reg/adapter/githubcr/adapter.go:43]: the factory for adapter github-ghcr registered
-2026-08-18T14:21:40Z [INFO] [/pkg/reg/adapter/gitlab/adapter.go:33]: the factory for adapter gitlab registered
-2026-08-18T14:21:40Z [INFO] [/pkg/reg/adapter/googlegcr/adapter.go:38]: the factory for adapter google-gcr registered
-2026-08-18T14:21:40Z [INFO] [/pkg/reg/adapter/huawei/huawei_adapter.go:40]: the factory of Huawei adapter was registered
-2026-08-18T14:21:40Z [INFO] [/pkg/reg/adapter/jfrog/adapter.go:42]: the factory of jfrog artifactory adapter was registered
-2026-08-18T14:21:40Z [INFO] [/pkg/reg/adapter/quay/adapter.go:53]: the factory of Quay adapter was registered
-2026-08-18T14:21:40Z [INFO] [/pkg/reg/adapter/tencentcr/adapter.go:58]: the factory for adapter tencent-tcr registered
-2026-08-18T14:21:40Z [INFO] [/pkg/reg/adapter/volcenginecr/adapter.go:40]: the factory for adapter volcengine-cr registered
-2026-08-18T14:21:40Z [INFO] [/pkg/reg/adapter/harbor/adaper.go:31]: the factory for adapter harbor registered
-2026-08-18T14:21:40Z [INFO] [/jobservice/worker/cworker/c_worker.go:445]: Register job *scan.Job with name IMAGE_SCAN
-2026-08-18T14:21:40Z [INFO] [/jobservice/worker/cworker/c_worker.go:445]: Register job *legacy.ScanAllScheduler with name IMAGE_SCAN_ALL
-2026-08-18T14:21:40Z [INFO] [/jobservice/worker/cworker/c_worker.go:445]: Register job *scandataexport.ScanDataExport with name SCAN_DATA_EXPORT
-2026-08-18T14:22:31Z [INFO] [/jobservice/worker/cworker/c_worker.go:77]: Job incoming: {"name":"IMAGE_SCAN","id":"688819962485bc6d02b6a9bc","t":1787062951,"args":null}
-2026-08-18T14:22:33Z [INFO] [/pkg/scan/postprocessors/report_converters.go:198][report="3a7b38fd-15fb-421a-be5c-df9af65728ce" scanner="a2f6ff36-962a-11f1-8652-0a580a80041b" vulnerabilityRecords="0"]: Converted vulnerability records to the new schema
-2026-08-18T14:22:33Z [INFO] [/jobservice/runner/redis.go:152]: Job 'IMAGE_SCAN:688819962485bc6d02b6a9bc' exit with success
-
-==================================================================
-== END
-==================================================================
-Collected to: adapter-triage-20260818-142220.log
-scp it over as-is — credentials are fingerprints only.
+Given SBOM is a hard requirement for you, the honest framing is: NeuVector replaces Trivy for *vulnerability scanning* only, and something else has to own SBOM. That was finding #4 two rounds ago and nothing since has changed it.
