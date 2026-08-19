@@ -1,0 +1,73 @@
+Good question — and there's a real correction buried in it. Let me verify the TLS behaviour rather than assert it.
+
+Your Harbor-side understanding is correct. Your NeuVector-side description can't be literally true — and checking which it actually is matters, because one version of it breaks silently next year.
+
+## There is only one rule, applied twice
+
+In TLS the **server sends its leaf certificate** (and usually its intermediates) in every handshake. The client never needs a copy of the leaf. What the client needs is a **trust anchor** — some certificate in the chain that it already holds and has decided to trust — so it can verify the signatures from the leaf upward until it reaches that anchor.
+
+So the two sides aren't doing different things. They're doing the same thing with a different anchor:
+
+| direction | who presents what | what the client holds |
+|---|---|---|
+| Harbor → adapter | adapter presents its leaf, signed by the NeuVector internal CA | Harbor holds `ca.crt` — the **issuer** |
+| NeuVector → Harbor | Harbor presents its leaf, signed by `Issuing CA G1` | NeuVector holds… whatever you put in `cacerts` |
+
+## Your Harbor side is right, and rotation-proof
+
+You anchored at the CA. When cert-manager reissues the adapter's leaf next year, the new leaf is signed by the *same* CA key, so Harbor validates it with the `ca.crt` it already has. **No bundle update, no core restart.** That's precisely why PKI has CAs — otherwise every leaf rotation anywhere would mean redistributing certificates to every client.
+
+Demonstrated:
+
+```
+== anchor = CA, verify leaf1 ==            leaf1.pem: OK
+== anchor = CA, verify leaf2 (rotated) ==  leaf2.pem: OK
+```
+
+Your worry about the adapter's 1-year `inClusterCert` is unfounded. Harbor doesn't care.
+
+## Your NeuVector side — the description doesn't match how verification works
+
+If you had put **only Harbor's leaf certificate** into `cacerts`, it would not have worked at all:
+
+```
+== anchor = leaf1 itself, verify leaf1 ==
+error 20 at 0 depth lookup: unable to get local issuer certificate
+```
+
+A leaf can't anchor itself. Chain building matches a certificate's *issuer* name against a candidate's *subject* name, and a leaf's issuer is the CA, not itself. Go's verifier works the same way. So since your scans started working, **the file you added must contain the issuer** — either because "export the public cert" gave you the chain, or because what you grabbed was actually the CA. Very common; the terminology in browsers and export dialogs is loose.
+
+The distinction is not academic. If the anchor you gave NeuVector is short-lived, it stops validating when Harbor's certificate rotates — and that failure is the **silent** one: empty report → `severity: None` → Harbor lets the image through.
+
+## How to check what you actually have
+
+What's in NeuVector's trust config:
+
+```bash
+openssl x509 -in <the-pem-you-added> -noout -subject -issuer -dates
+grep -c "BEGIN CERTIFICATE" <the-pem-you-added>
+```
+
+- `subject` == `issuer` → self-signed root. **Best anchor**, longest-lived.
+- `subject=CN=Issuing CA G1` → the intermediate. Works (Go accepts any pool member as an anchor, more permissively than OpenSSL), but it expires sooner than the root.
+- `subject=CN=registry.domain.corp` → the leaf, and given the test above it shouldn't have worked — so if you see this, there's more than one certificate in the file.
+
+What Harbor actually presents:
+
+```bash
+openssl s_client -connect registry.domain.corp:443 \
+  -servername registry.domain.corp -showcerts </dev/null 2>/dev/null \
+  | grep -E "^(subject|issuer)"
+```
+
+If Harbor sends leaf + intermediate, NeuVector only needs the **root**. If it sends only the leaf, NeuVector needs intermediate + root.
+
+**Recommendation either way: anchor on the root** (or root + intermediate). Your org root has a multi-year life and rotates with notice; anchoring there means Harbor's yearly certificate renewals are invisible to NeuVector, exactly as the adapter's renewals are invisible to Harbor.
+
+## One gotcha this raises, worth knowing
+
+The adapter reads its certificate **once, at process start**. `dcs.adapter.inClusterCert` is 1 year with `renewBefore: 720h`, so cert-manager writes a fresh leaf into the secret 30 days before expiry — but the running pod keeps serving the old one until something restarts it. If nothing restarts it within those 30 days, the served certificate expires and Harbor→adapter breaks.
+
+That break is at least *loud* (ping fails, mime-type error, Harbor blocks the pull). Still, it's worth either a reloader annotation on `core.cve.adapter.podAnnotations` or a longer `renewBefore`. Say the word if you want me to change the default.
+
+Nothing above changes your working config — your Harbor side is textbook, and your NeuVector side is almost certainly fine too. It's the *label* on what you put in `cacerts` that's worth confirming, since it determines whether next year is a non-event or a silent one.
